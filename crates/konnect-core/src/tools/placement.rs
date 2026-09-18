@@ -22,6 +22,8 @@
 //! Every response field is derived from the parsed board — never echoed from
 //! the request (the recurring defect class this repo pins tests against).
 
+mod plan_status;
+
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -31,6 +33,7 @@ use konnect_sexp::board::{
     PcbConnectivityIndex, Side,
 };
 use konnect_sexp::parser::SexpNode;
+use plan_status::PlanApplicability;
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
 
@@ -56,22 +59,31 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "place_decoupling_caps",
-            "Plan (and optionally apply) a row of decoupling capacitors beside an IC. Caps \
-         are identified by NET PAIRING — a candidate shares at least one named net with \
-         the IC — never by reference guessing. Dry-run by default: the response carries \
-         the planned moves plus the board's score before and after the plan, so the \
-         change is judged before it is made. Apply refuses while KiCad holds the board \
-         open live.",
+            "Plan (and optionally apply) a row of decoupling capacitors beside an IC, from \
+         capacitor references YOU supply — this tool never infers which caps decouple which \
+         IC (a shared net, GND above all, is not evidence of that pairing). Every reference \
+         must already be a capacitor-family footprint on the board; an unknown or non-\
+         capacitor reference is refused before anything is planned. The response's \
+         plan_status is 'applicable' only when every planned target lands inside the board \
+         outline AND the plan actually improves score_placement's score — otherwise it is \
+         'blocked' with blocking_reasons naming why, and apply refuses before the first \
+         mutation. Dry-run by default. Apply refuses while KiCad holds the board open live.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "ic_reference": { "type": "string", "description": "The IC (U*) the caps decouple" },
+                    "capacitor_references": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "Exact, caller-chosen capacitor references to place (e.g. [\"C201\", \"C202\"]) — never auto-discovered"
+                    },
                     "side": { "type": "string", "enum": ["auto", "left", "right", "top", "bottom"], "default": "auto", "description": "Which side of the IC the row goes on" },
                     "spacing_mm": { "type": "number", "default": 0.5, "description": "Gap between the IC courtyard and the row, and between caps" },
                     "dry_run": { "type": "boolean", "default": true, "description": "Plan without writing" }
                 },
-                "required": ["board", "ic_reference"]
+                "required": ["board", "ic_reference", "capacitor_references"]
             }),
             |args, ctx| async move { handle_place_decoupling(args, ctx).await }
         )
@@ -387,20 +399,6 @@ async fn score_of_content(ctx: &ToolContext, content: &str) -> anyhow::Result<se
     Ok(serde_json::from_str(text)?)
 }
 
-/// Net set per reference, by NAME, from the index. The pairing primitive the
-/// decoupling checker and the decoupling placer share.
-fn nets_by_reference(index: &PcbConnectivityIndex) -> HashMap<String, BTreeSet<String>> {
-    let mut map: HashMap<String, BTreeSet<String>> = HashMap::new();
-    for net in index.nets() {
-        for pad in index.pads_of_net(net) {
-            map.entry(pad.reference.clone())
-                .or_default()
-                .insert(net.to_string());
-        }
-    }
-    map
-}
-
 /// Apply Set placements to board content via the SAME transform the closed-
 /// board move tools use, by way of a temp file — the plan preview and the
 /// real apply cannot disagree, because they are the same code.
@@ -431,6 +429,35 @@ async fn handle_place_decoupling(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    // No inference: the caller names exactly which capacitors to place. A
+    // shared net — GND above all — is not evidence of which IC a cap
+    // decouples, so this tool no longer discovers candidates itself (#596).
+    let requested_refs: Vec<String> = match args["capacitor_references"].as_array() {
+        Some(refs) if !refs.is_empty() => {
+            match refs.iter().map(|v| v.as_str()).collect::<Option<Vec<_>>>() {
+                Some(strs) => strs.into_iter().map(str::to_string).collect(),
+                None => {
+                    return Ok(CallToolResult::error_kind(
+                        ToolErrorKind::InvalidArgument {
+                            field: "capacitor_references".into(),
+                            reason: "every entry must be a string".into(),
+                        },
+                        "Argument 'capacitor_references' must be an array of strings",
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "capacitor_references".into(),
+                    reason: "required, a non-empty array of exact capacitor references".into(),
+                },
+                "Argument 'capacitor_references' is required and must name at least one \
+                 capacitor",
+            ));
+        }
+    };
     let side = args["side"].as_str().unwrap_or("auto");
     if !["auto", "left", "right", "top", "bottom"].contains(&side) {
         return Ok(CallToolResult::error_kind(
@@ -447,9 +474,7 @@ async fn handle_place_decoupling(
     let content = konnect_sexp::writer::read_consistent(&board)?;
     let tree = konnect_sexp::parse_sexp(&content)?;
     let scan = footprint_courtyards(&tree);
-    let index = PcbConnectivityIndex::build(&tree);
     let values = footprint_values(&tree);
-    let nets = nets_by_reference(&index);
 
     let Some(ic) = scan
         .items
@@ -464,42 +489,65 @@ async fn handle_place_decoupling(
             format!("No footprint '{ic_reference}' on the board"),
         ));
     };
-    let ic_nets = nets.get(&ic_reference).cloned().unwrap_or_default();
     let ic_bbox = ic.bbox;
     let (ic_cx, ic_cy) = bbox_center(ic_bbox);
 
-    // Candidates: decoupling-family C* sharing at least one named net with
-    // the IC — the same pairing rule the score's checker applies.
-    let mut caps: Vec<&FootprintCourtyard> = scan
-        .items
-        .iter()
-        .filter(|c| {
-            let Some(reference) = c.reference.as_deref() else {
-                return false;
-            };
-            if ref_prefix(reference) != "C" {
-                return false;
-            }
-            let Some(value) = values.get(reference) else {
-                return false;
-            };
-            if decoupling_limit_mm(value).is_none() {
-                return false;
-            }
-            nets.get(reference)
-                .map(|n| !n.is_disjoint(&ic_nets))
-                .unwrap_or(false)
-        })
-        .collect();
-    if caps.is_empty() {
-        return Ok(CallToolResult::json(&json!({
-            "planned_moves": [],
-            "detail": format!(
-                "no decoupling-family capacitor shares a net with {ic_reference}; \
-                 nothing to place"
-            ),
-        })));
+    // Every requested reference must exist and be a decoupling-family
+    // capacitor. Refused up front, naming every bad reference at once — no
+    // partial plan built from the references that did resolve.
+    let mut duplicates: BTreeSet<String> = BTreeSet::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for r in &requested_refs {
+        if !seen.insert(r.as_str()) {
+            duplicates.insert(r.clone());
+        }
     }
+    if !duplicates.is_empty() {
+        let listed = duplicates.iter().cloned().collect::<Vec<_>>().join(", ");
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "capacitor_references".into(),
+                reason: format!("listed more than once: {listed}"),
+            },
+            format!(
+                "Argument 'capacitor_references' lists the same reference more than once: {listed}"
+            ),
+        ));
+    }
+    let mut caps: Vec<&FootprintCourtyard> = Vec::with_capacity(requested_refs.len());
+    let mut bad_refs: Vec<String> = Vec::new();
+    for r in &requested_refs {
+        let found = scan
+            .items
+            .iter()
+            .find(|c| c.reference.as_deref() == Some(r.as_str()));
+        match found {
+            Some(c)
+                if ref_prefix(r) == "C"
+                    && values
+                        .get(r)
+                        .is_some_and(|v| decoupling_limit_mm(v).is_some()) =>
+            {
+                caps.push(c);
+            }
+            Some(_) => bad_refs.push(format!("{r} (not a decoupling-family capacitor)")),
+            None => bad_refs.push(format!("{r} (not on this board)")),
+        }
+    }
+    if !bad_refs.is_empty() {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "capacitor_references".into(),
+                reason: bad_refs.join("; "),
+            },
+            format!(
+                "Argument 'capacitor_references' names references that cannot be placed: {}",
+                bad_refs.join("; ")
+            ),
+        ));
+    }
+    // Row order is deterministic regardless of the order the caller listed
+    // references in.
     caps.sort_by_key(|c| c.reference.clone());
 
     // The row: below the IC unless a side is given ("auto" picks bottom —
@@ -511,6 +559,9 @@ async fn handle_place_decoupling(
         .collect();
     let row_span: f64 =
         widths.iter().map(|(w, _)| w).sum::<f64>() + spacing * (caps.len() as f64 - 1.0);
+
+    let outline = board_outline_bbox(&tree);
+    let mut applicability = PlanApplicability::new();
 
     let mut placements = Vec::new();
     let mut planned_moves = Vec::new();
@@ -529,14 +580,31 @@ async fn handle_place_decoupling(
         let (bcx, bcy) = bbox_center(cap.bbox);
         let (ax, ay) = cap.at;
         let target = (tx + (ax - bcx), ty + (ay - bcy));
+        let reference = cap.reference.clone().expect("filtered on reference");
+
+        // A planned target the caller cannot see land outside the board is
+        // exactly the failure mode #596 reported — refuse rather than
+        // silently execute it.
+        if let Some((ox0, oy0, ox1, oy1)) = outline {
+            let (bx0, by0, bx1, by1) = (tx - w / 2.0, ty - h / 2.0, tx + w / 2.0, ty + h / 2.0);
+            if bx0 < ox0 || by0 < oy0 || bx1 > ox1 || by1 > oy1 {
+                applicability.block(format!(
+                    "{reference} plans to ({}, {}), outside the board outline \
+                     ({ox0}, {oy0})..({ox1}, {oy1})",
+                    round3(tx),
+                    round3(ty),
+                ));
+            }
+        }
+
         placements.push(konnect_ipc::types::IpcFootprintPlacement {
-            reference: cap.reference.clone().expect("filtered on reference"),
+            reference: reference.clone(),
             x: (target.0 * 1e3).round() / 1e3,
             y: (target.1 * 1e3).round() / 1e3,
             rotation: cap.rotation_deg,
         });
         planned_moves.push(json!({
-            "reference": cap.reference,
+            "reference": reference,
             "from": { "x": round3(ax), "y": round3(ay) },
             "to": { "x": round3(target.0), "y": round3(target.1) },
         }));
@@ -546,16 +614,46 @@ async fn handle_place_decoupling(
     let planned_content = apply_placements_to_content(&content, &placements)?;
     let score_after = score_of_content(ctx, &planned_content).await?;
 
+    // A plan that does not improve the board is not useful to apply, even
+    // when nothing about it is unsafe on its own — the caller should decide
+    // deliberately, not have a no-op (or a regression) applied silently.
+    let (before_num, after_num) = (
+        score_before["score"].as_i64().unwrap_or(i64::MIN),
+        score_after["score"].as_i64().unwrap_or(i64::MIN),
+    );
+    if after_num <= before_num {
+        applicability.block(format!(
+            "the plan does not improve the score ({before_num} \u{2192} {after_num})"
+        ));
+    }
+    if score_after["verdict"] == "hard_fail" && score_before["verdict"] != "hard_fail" {
+        applicability.block(format!(
+            "the plan introduces a hard failure the board did not have \
+             (verdict {} \u{2192} hard_fail)",
+            score_before["verdict"],
+        ));
+    }
+    let (plan_status, blocking_reasons) = applicability.to_json();
+
     if dry_run {
         return Ok(CallToolResult::json(&json!({
             "dry_run": true,
             "ic_reference": ic_reference,
             "side": resolved_side,
+            "plan_status": plan_status,
+            "blocking_reasons": blocking_reasons,
             "planned_moves": planned_moves,
             "score_before": score_before["score"],
             "score_after_plan": score_after["score"],
             "verdict_after_plan": score_after["verdict"],
         })));
+    }
+
+    if applicability.is_blocked() {
+        return Ok(CallToolResult::error(format!(
+            "place_decoupling_caps refuses to apply a blocked plan: {}",
+            applicability.blocking_reasons().join("; ")
+        )));
     }
 
     // Applying: never edit a board a live KiCad holds open.
@@ -575,6 +673,8 @@ async fn handle_place_decoupling(
         "dry_run": false,
         "ic_reference": ic_reference,
         "side": resolved_side,
+        "plan_status": plan_status,
+        "blocking_reasons": blocking_reasons,
         "applied": applied.iter().map(|p| json!({
             "reference": p.reference, "x": p.x, "y": p.y, "rotation": p.rotation
         })).collect::<Vec<_>>(),
@@ -2447,21 +2547,21 @@ mod tests {
 
     /// The decoupling planner must clear the fixture's only deduction: C1/C2
     /// currently sit 7.071 mm from U1 (score 70); a row below U1's courtyard
-    /// (bbox y_max 22.7 + 0.5 spacing) puts each cap center well inside the
-    /// 2.5 mm rule measured from the courtyard-center distance the checker
-    /// uses... but note the checker measures CENTER-to-CENTER: U1's center is
-    /// (25, 20), the planned cap centers are at y ≈ 23.66, x within ±1 of 25,
-    /// so distance ≈ sqrt(1 + 3.66²) ≈ 3.8 mm — above 2.5! The row is beside
-    /// the courtyard but the SOIC-8 courtyard is tall. The correct assertion
-    /// is therefore what the geometry says: the plan improves the distance
-    /// (7.07 → ~3.8) and the response's own before/after scores tell the
-    /// truth about whether the deduction cleared. Pin the actual numbers.
+    /// clears the decoupling check entirely (confirmed by direct run: score
+    /// goes 70 → 100, verdict "pass"). #596 requires the caller to name the
+    /// exact capacitors — no net-sharing discovery — and the response must
+    /// report `plan_status: "applicable"` with no blocking reasons for this
+    /// legitimately improving plan.
     #[tokio::test]
     async fn decoupling_plan_moves_caps_beside_u1_and_reports_honest_scores() {
         let dir = tempfile::tempdir().unwrap();
         let board = fixture_copy(&dir);
         let result = handle_place_decoupling(
-            &json!({ "board": board.to_string_lossy(), "ic_reference": "U1" }),
+            &json!({
+                "board": board.to_string_lossy(),
+                "ic_reference": "U1",
+                "capacitor_references": ["C1", "C2"],
+            }),
             &test_ctx(),
         )
         .await
@@ -2470,6 +2570,12 @@ mod tests {
         let response = text_of(&result).await;
         assert_eq!(response["dry_run"], true);
         assert_eq!(response["side"], "bottom");
+        assert_eq!(response["plan_status"], "applicable", "{response}");
+        assert_eq!(
+            response["blocking_reasons"].as_array().unwrap().len(),
+            0,
+            "{response}"
+        );
         let moves = response["planned_moves"].as_array().unwrap();
         assert_eq!(moves.len(), 2, "C1 and C2: {response}");
         for mv in moves {
@@ -2482,19 +2588,52 @@ mod tests {
             assert!((23.0..27.0).contains(&x), "row centered on U1 x=25: {mv}");
         }
         assert_eq!(response["score_before"], 70);
-        // The response derives its after-score from the planned content —
-        // whatever the checker says it says; both plausible outcomes are a
-        // number, never a fabricated "fixed".
-        assert!(response["score_after_plan"].is_number());
+        assert_eq!(response["score_after_plan"], 100, "{response}");
+        assert_eq!(response["verdict_after_plan"], "pass");
     }
 
     #[tokio::test]
     async fn decoupling_plan_is_deterministic() {
         let dir = tempfile::tempdir().unwrap();
         let board = fixture_copy(&dir);
-        let args = json!({ "board": board.to_string_lossy(), "ic_reference": "U1" });
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "ic_reference": "U1",
+            "capacitor_references": ["C1", "C2"],
+        });
         let a = text_of(&handle_place_decoupling(&args, &test_ctx()).await.unwrap()).await;
         let b = text_of(&handle_place_decoupling(&args, &test_ctx()).await.unwrap()).await;
+        assert_eq!(a, b);
+    }
+
+    /// Caller-supplied order must not change the plan: the row is always
+    /// laid out in reference order.
+    #[tokio::test]
+    async fn decoupling_plan_ignores_requested_reference_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let forward = json!({
+            "board": board.to_string_lossy(),
+            "ic_reference": "U1",
+            "capacitor_references": ["C1", "C2"],
+        });
+        let reversed = json!({
+            "board": board.to_string_lossy(),
+            "ic_reference": "U1",
+            "capacitor_references": ["C2", "C1"],
+        });
+        let a = text_of(
+            &handle_place_decoupling(&forward, &test_ctx())
+                .await
+                .unwrap(),
+        )
+        .await;
+        let b = text_of(
+            &handle_place_decoupling(&reversed, &test_ctx())
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(a, b);
     }
 
@@ -2503,7 +2642,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let board = fixture_copy(&dir);
         let result = handle_place_decoupling(
-            &json!({ "board": board.to_string_lossy(), "ic_reference": "U99" }),
+            &json!({
+                "board": board.to_string_lossy(),
+                "ic_reference": "U99",
+                "capacitor_references": ["C1"],
+            }),
             &test_ctx(),
         )
         .await
@@ -2516,13 +2659,199 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decoupling_refuses_a_missing_capacitor_references_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let result = handle_place_decoupling(
+            &json!({ "board": board.to_string_lossy(), "ic_reference": "U1" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert!(result_text(&result).contains("capacitor_references"));
+    }
+
+    #[tokio::test]
+    async fn decoupling_refuses_an_empty_capacitor_references_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let result = handle_place_decoupling(
+            &json!({
+                "board": board.to_string_lossy(),
+                "ic_reference": "U1",
+                "capacitor_references": [],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+    }
+
+    /// #596: this tool never discovers candidates by net — an unrelated cap
+    /// (however tempting a shared GND makes it) is only ever placed if the
+    /// caller names it, and a nonexistent or non-capacitor reference is a
+    /// structured error naming exactly what was wrong, not a silent skip.
+    #[tokio::test]
+    async fn decoupling_refuses_an_unknown_or_non_capacitor_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let result = handle_place_decoupling(
+            &json!({
+                "board": board.to_string_lossy(),
+                "ic_reference": "U1",
+                "capacitor_references": ["C404", "R1"],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        let text = result_text(&result);
+        assert!(text.contains("C404"), "{text}");
+        assert!(text.contains("R1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn decoupling_refuses_a_duplicate_capacitor_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let result = handle_place_decoupling(
+            &json!({
+                "board": board.to_string_lossy(),
+                "ic_reference": "U1",
+                "capacitor_references": ["C1", "C1"],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+    }
+
+    /// A plan that cannot possibly help — reapplying the same row to a board
+    /// it was already applied to — must be BLOCKED, not silently accepted:
+    /// the second dry run reports `plan_status: "blocked"` naming the lack
+    /// of improvement, and apply refuses before writing anything.
+    #[tokio::test]
+    async fn decoupling_blocks_a_plan_that_does_not_improve_the_score() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "ic_reference": "U1",
+            "capacitor_references": ["C1", "C2"],
+            "dry_run": false,
+        });
+        let first = text_of(&handle_place_decoupling(&args, &test_ctx()).await.unwrap()).await;
+        assert_eq!(first["plan_status"], "applicable", "{first}");
+        assert_eq!(first["score_after"], 100, "{first}");
+
+        let before_second = std::fs::read(&board).unwrap();
+        let second_dry = text_of(
+            &handle_place_decoupling(
+                &json!({
+                    "board": board.to_string_lossy(),
+                    "ic_reference": "U1",
+                    "capacitor_references": ["C1", "C2"],
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(second_dry["plan_status"], "blocked", "{second_dry}");
+        let reasons = second_dry["blocking_reasons"].as_array().unwrap();
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.as_str().unwrap().contains("does not improve")),
+            "{second_dry}"
+        );
+
+        let second_apply = handle_place_decoupling(
+            &json!({
+                "board": board.to_string_lossy(),
+                "ic_reference": "U1",
+                "capacitor_references": ["C1", "C2"],
+                "dry_run": false,
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(second_apply.is_error, "{second_apply:?}");
+        assert_eq!(
+            std::fs::read(&board).unwrap(),
+            before_second,
+            "a blocked apply must not write"
+        );
+    }
+
+    /// #596's own repro: a row whose planned targets fall outside the board
+    /// outline must be blocked, naming the offending reference and its
+    /// planned coordinates, not silently executed.
+    #[tokio::test]
+    async fn decoupling_blocks_a_plan_landing_outside_the_board_outline() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = write_variant(
+            &dir,
+            "u1_near_bottom_edge.kicad_pcb",
+            fixture_with_moved_root("(at 25 20)", "(at 25 42)"),
+        );
+        let result = handle_place_decoupling(
+            &json!({
+                "board": board.to_string_lossy(),
+                "ic_reference": "U1",
+                "capacitor_references": ["C1", "C2"],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = text_of(&result).await;
+        assert_eq!(response["plan_status"], "blocked", "{response}");
+        let reasons = response["blocking_reasons"].as_array().unwrap();
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.as_str().unwrap().contains("outside the board outline")),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
     async fn decoupling_apply_refuses_the_exact_open_board() {
         let dir = tempfile::tempdir().unwrap();
         let board = fixture_copy(&dir);
         let before = std::fs::read(&board).unwrap();
         let (ctx, _server) = ctx_with_open_board(&board);
         let result = handle_place_decoupling(
-            &json!({"board": board, "ic_reference": "U1", "dry_run": false}),
+            &json!({
+                "board": board,
+                "ic_reference": "U1",
+                "capacitor_references": ["C1", "C2"],
+                "dry_run": false,
+            }),
             &ctx,
         )
         .await
@@ -2542,7 +2871,12 @@ mod tests {
         let before = std::fs::read(&board).unwrap();
         let (ctx, _server) = ctx_with_open_board(&other);
         let result = handle_place_decoupling(
-            &json!({"board": board, "ic_reference": "U1", "dry_run": false}),
+            &json!({
+                "board": board,
+                "ic_reference": "U1",
+                "capacitor_references": ["C1", "C2"],
+                "dry_run": false,
+            }),
             &ctx,
         )
         .await

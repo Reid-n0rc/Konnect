@@ -155,7 +155,9 @@ after its own plan, so a change is judged before it is made:
    clusters; explicitly a starting point, not a final layout.
 3. `refine_placement_force_directed` — deterministic spring embedder; pass
    `locked` for parts that must not move. Same input, same plan.
-4. `place_decoupling_caps` — plans a row beside an IC, paired by shared nets.
+4. `place_decoupling_caps` — plans a row beside an IC from exact caller-given
+   `capacitor_references` (never net-inferred); reports a blocked plan status
+   naming why, and refuses to apply an out-of-bounds or non-improving plan.
 5. `plan_bga_fanout` — pitch detected from the pad grid; `apply` executes as
    one KiCad undo commit over live IPC.
 
