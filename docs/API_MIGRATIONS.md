@@ -975,3 +975,17 @@ KiCad 10 boards still refuse the operation before writing because they have no
 top-level numeric net table. That refusal is now the structured
 `unsupported_capability` kind. Create a KiCad 10 net by naming it on a pad or
 copper item instead.
+
+## Unreleased: `score_placement` discloses whether it scored a live or saved board (patch release)
+
+`score_placement` always read the saved `.kicad_pcb` file, even when KiCad held
+that exact board open live with unsaved moves or edits. A hard courtyard-overlap
+introduced by a live `move_component` could be entirely absent from the response
+with no error and no indication the answer was stale (#595).
+
+The tool now prefers the exact board's live IPC snapshot (via `SaveDocumentToString`,
+the same read-only mechanism `run_drc`'s `sync_live_board` uses) when KiCad has it
+open, falling back to the saved file otherwise. Scoring policy and every existing
+field are unchanged; the response adds `source`, either `"ipc"` or `"saved_file"`
+(matching `run_drc`'s own source-disclosure convention), so a caller can tell
+which board state was judged.

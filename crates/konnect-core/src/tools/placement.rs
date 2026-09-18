@@ -25,7 +25,7 @@
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, ToolContext, ToolDef};
+use crate::tools::{get_path, with_board_ipc_classified, ToolContext, ToolDef};
 use konnect_sexp::board::{
     board_outline_bbox, footprint_courtyards, footprints, CourtyardSource, FootprintCourtyard,
     PcbConnectivityIndex, Side,
@@ -160,23 +160,60 @@ const CONNECTOR_EDGE_LIMIT_MM: f64 = 10.0;
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
-async fn handle_score_placement(
-    args: &serde_json::Value,
-    _ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    let board = get_path(args, "board")?;
-    let content = match konnect_sexp::writer::read_consistent(&board) {
-        Ok(content) => content,
+/// Read the saved board file, distinguishing "does not exist" from any other
+/// I/O failure the way [`handle_score_placement`]'s file-fallback path always
+/// has — extracted so the live-IPC attempt above it can share the same error
+/// shape.
+fn read_saved_board(board: &std::path::Path) -> anyhow::Result<Result<String, CallToolResult>> {
+    match konnect_sexp::writer::read_consistent(board) {
+        Ok(content) => Ok(Ok(content)),
         Err(error) => {
             if !board.exists() {
-                return Ok(CallToolResult::error_kind(
+                Ok(Err(CallToolResult::error_kind(
                     ToolErrorKind::FileNotFound {
                         path: board.display().to_string(),
                     },
                     format!("Board file not found: {}", board.display()),
-                ));
+                )))
+            } else {
+                Err(error.into())
             }
-            return Err(error.into());
+        }
+    }
+}
+
+async fn handle_score_placement(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+
+    // The exact board open live in KiCad, when it is this one, is the truthful
+    // source: a saved-file read here would silently score a stale snapshot
+    // against moves and edits KiCad already applied but hasn't written to
+    // disk yet — the failure mode #595 was filed against. The saved file
+    // remains the disclosed fallback for a closed or unreachable board;
+    // scoring policy itself is unchanged either way.
+    let live =
+        with_board_ipc_classified(ctx, &board, move |client| client.save_document_to_string())
+            .await?;
+    let (content, source) = match live {
+        Ok(content) => (content, "ipc"),
+        Err(konnect_ipc::IpcFailure::Unreachable(_)) => match read_saved_board(&board)? {
+            Ok(content) => (content, "saved_file"),
+            Err(result) => return Ok(result),
+        },
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) if error.proves_not_open() => {
+            match read_saved_board(&board)? {
+                Ok(content) => (content, "saved_file"),
+                Err(result) => return Ok(result),
+            }
+        }
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+            return Ok(crate::tools::ipc_target_error_result(&error));
+        }
+        Err(konnect_ipc::IpcFailure::Rejected(message)) => {
+            return Ok(CallToolResult::error(message));
         }
     };
     let tree = konnect_sexp::parse_sexp(&content)?;
@@ -368,6 +405,7 @@ async fn handle_score_placement(
             .collect::<Vec<_>>(),
         "footprints_scored": scan.items.len(),
         "footprints_skipped": scan.skipped,
+        "source": source,
     })))
 }
 
@@ -1799,6 +1837,181 @@ mod tests {
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0]["reference"], "J1");
         assert_eq!(edges[0]["edge_distance_mm"], 8.81);
+
+        // No live KiCad in this test — the saved file is the disclosed source.
+        assert_eq!(response["source"], "saved_file");
+    }
+
+    /// #595: when the exact board is open live in KiCad, `score_placement`
+    /// must score the live snapshot — not a stale saved file — and disclose
+    /// that it did. The file on disk here is deliberately near-empty so a
+    /// score/footprint-count match with the fixture only holds if the live
+    /// snapshot, not the file, was scored.
+    #[tokio::test]
+    async fn a_board_open_live_in_kicad_is_scored_from_the_live_snapshot() {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20240108) (generator konnect))").unwrap();
+        let live = std::fs::read_to_string(FIXTURE).unwrap();
+
+        let server = crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&board, {
+            let live = live.clone();
+            move |command| {
+                if command.type_url.ends_with("SaveDocumentToString") {
+                    kiapi::common::commands::SaveDocumentToString::decode(command.value.as_slice())
+                        .expect("well-formed SaveDocumentToString request");
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            contents: live.clone(),
+                            document: None,
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    ))
+                } else {
+                    None
+                }
+            }
+        });
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+
+        let result = handle_score_placement(&json!({ "board": board.to_string_lossy() }), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "score_placement errored: {result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+
+        assert_eq!(response["source"], "ipc");
+        assert_eq!(response["footprints_scored"], 8, "{response}");
+        assert_eq!(response["score"], 70, "{response}");
+    }
+
+    /// #595's exact reported failure mode, reproduced directly: the saved
+    /// file is the clean fixture (no collision, would score 70), but KiCad
+    /// holds this exact board live with C2 already moved onto C1 — the same
+    /// courtyard-collision-inducing move `overlapping_courtyards_are_a_hard_fail_naming_the_pair`
+    /// uses. A saved-file-only read would report a clean board; scoring the
+    /// live snapshot must report the hard failure instead.
+    #[tokio::test]
+    async fn a_live_move_that_creates_a_collision_is_reported_not_the_clean_saved_file() {
+        use konnect_ipc::gen::kiapi;
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let clean = std::fs::read_to_string(FIXTURE).unwrap();
+        std::fs::write(&board, &clean).unwrap();
+
+        assert_eq!(clean.matches("(at 30 15 90)").count(), 1);
+        let live_after_move = clean.replace("(at 30 15 90)", "(at 20 15 90)");
+
+        let server = crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&board, {
+            let live_after_move = live_after_move.clone();
+            move |command| {
+                if command.type_url.ends_with("SaveDocumentToString") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            contents: live_after_move.clone(),
+                            document: None,
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    ))
+                } else {
+                    None
+                }
+            }
+        });
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+
+        let result = handle_score_placement(&json!({ "board": board.to_string_lossy() }), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "score_placement errored: {result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+
+        assert_eq!(response["source"], "ipc", "{response}");
+        assert_eq!(
+            response["verdict"], "hard_fail",
+            "the saved file alone is clean; only the live snapshot has the collision: {response}"
+        );
+        assert_eq!(response["score"], 50, "{response}");
+        let failures = response["hard_failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1, "{response}");
+        assert_eq!(failures[0]["kind"], "courtyard_overlap");
+        let refs = failures[0]["references"].as_array().unwrap();
+        assert!(refs.contains(&json!("C1")) && refs.contains(&json!("C2")));
+    }
+
+    /// Served `tools/call` coverage (not a direct handler call): proves
+    /// `score_placement` is wired through the real MCP dispatch layer with
+    /// the same live-vs-saved behavior, using the identical live-move
+    /// collision scenario above.
+    #[tokio::test]
+    async fn served_score_placement_reports_the_live_collision_over_the_clean_saved_file() {
+        use konnect_ipc::gen::kiapi;
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let clean = std::fs::read_to_string(FIXTURE).unwrap();
+        std::fs::write(&board, &clean).unwrap();
+        let live_after_move = clean.replace("(at 30 15 90)", "(at 20 15 90)");
+
+        let server = crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&board, {
+            let live_after_move = live_after_move.clone();
+            move |command| {
+                if command.type_url.ends_with("SaveDocumentToString") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            contents: live_after_move.clone(),
+                            document: None,
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    ))
+                } else {
+                    None
+                }
+            }
+        });
+
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: server.address().to_string(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 595,
+                "method": "tools/call",
+                "params": {
+                    "name": "score_placement",
+                    "arguments": { "board": board.to_string_lossy() }
+                }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+
+        assert_eq!(response["isError"], json!(false), "{body}");
+        assert_eq!(body["source"], "ipc", "{body}");
+        assert_eq!(body["verdict"], "hard_fail", "{body}");
+        assert_eq!(body["score"], 50, "{body}");
     }
 
     /// Synthetic variant derived from the KiCad-authored fixture by string
