@@ -127,6 +127,7 @@ enum BoardLayer
   BL_User_45 = 98;
 }
 
+// Deprecated: Use Net with the name property only
 message NetCode
 {
   int32 value = 1;
@@ -135,7 +136,7 @@ message NetCode
 // Describes a copper item's net
 message Net
 {
-  // A unique code representing this net
+  // Deprecated: net codes are no longer used in KiCad
   NetCode code = 1;
 
   // Human-readable net name
@@ -152,6 +153,11 @@ message Track
   kiapi.common.types.LockedState locked = 5;
   BoardLayer                     layer  = 6;
   Net                            net    = 7;
+
+  // The ID of the parent container for this item (if any).  This is a read-only property; changing
+  // it will not change the object's parent
+  // Since: 10.0.6
+  kiapi.common.types.KIID parent = 8;
 }
 
 // Represents an arc track (not a PCB_SHAPE in arc shape)
@@ -167,6 +173,11 @@ message Arc
   kiapi.common.types.LockedState locked = 6;
   BoardLayer                     layer  = 7;
   Net                            net    = 8;
+
+  // The ID of the parent container for this item (if any).  This is a read-only property; changing
+  // it will not change the object's parent
+  // Since: 10.0.6
+  kiapi.common.types.KIID parent = 9;
 }
 
 // What copper layer shape mode the padstack uses
@@ -481,6 +492,11 @@ message Via
   Net net = 5;
 
   ViaType type = 6;
+
+  // The ID of the parent container for this item (if any).  This is a read-only property; changing
+  // it will not change the object's parent
+  // Since: 10.0.6
+  kiapi.common.types.KIID parent = 7;
 }
 
 message BoardGraphicShape
@@ -490,6 +506,58 @@ message BoardGraphicShape
   Net net = 3;
   kiapi.common.types.KIID  id = 4;
   kiapi.common.types.LockedState locked = 5;
+
+  // The ID of the parent container for this item (if any).  This is a read-only property; changing
+  // it will not change the object's parent
+  // Since: 10.0.6
+  kiapi.common.types.KIID parent = 6;
+}
+
+enum BarcodeKind
+{
+  BK_UNKNOWN = 0;
+  BK_CODE_39 = 1;
+  BK_CODE_128 = 2;
+  BK_DATA_MATRIX = 3;
+  BK_QR_CODE = 4;
+  BK_MICRO_QR_CODE = 5;
+}
+
+enum BarcodeErrorCorrection
+{
+  BEC_UNKNOWN = 0;
+  BEC_L = 1;
+  BEC_M = 2;
+  BEC_Q = 3;
+  BEC_H = 4;
+}
+
+message Barcode
+{
+  kiapi.common.types.KIID id = 1;
+
+  string text = 2;
+  BarcodeKind kind = 3;
+  BarcodeErrorCorrection error_correction = 4;
+
+  kiapi.common.types.Vector2 position = 5;
+  kiapi.common.types.Angle orientation = 6;
+  BoardLayer layer = 7;
+
+  kiapi.common.types.Distance width = 8;
+  kiapi.common.types.Distance height = 9;
+
+  bool show_text = 10;
+  kiapi.common.types.Distance text_height = 11;
+
+  bool knockout = 12;
+  kiapi.common.types.Vector2 knockout_margin = 13;
+  kiapi.common.types.LockedState locked = 14;
+
+  // The ID of the parent container for this item (if any).  This is a read-only property; changing
+  // it will not change the object's parent
+  // Since: 10.0.6
+  kiapi.common.types.KIID parent = 15;
 }
 
 // A board-specific text object, existing on a board layer
@@ -500,6 +568,11 @@ message BoardText
   BoardLayer layer = 3;
   bool knockout = 4;
   kiapi.common.types.LockedState locked = 5;
+
+  // The ID of the parent container for this item (if any).  This is a read-only property; changing
+  // it will not change the object's parent
+  // Since: 10.0.6
+  kiapi.common.types.KIID parent = 6;
 }
 
 // A board-specific textbox, existing on a board layer
@@ -509,6 +582,11 @@ message BoardTextBox
   kiapi.common.types.TextBox textbox = 2;
   BoardLayer layer = 3;
   kiapi.common.types.LockedState locked = 4;
+
+  // The ID of the parent container for this item (if any).  This is a read-only property; changing
+  // it will not change the object's parent
+  // Since: 10.0.6
+  kiapi.common.types.KIID parent = 5;
 }
 
 // NOTE: There has been some discussion about what to do with pad attributes and properties.
@@ -575,6 +653,13 @@ message Pad
 
   // Since: 10.0.0
   kiapi.common.types.Time pad_to_die_delay = 11;
+
+  // Field ID 12 used in 11.0
+
+  // The ID of the parent container for this item (if any).  This is a read-only property; changing
+  // it will not change the object's parent
+  // Since: 10.0.6
+  kiapi.common.types.KIID parent = 13;
 }
 
 enum ZoneType
@@ -743,6 +828,11 @@ message Zone
   kiapi.common.types.LockedState locked = 12;
 
   repeated ZoneLayerProperties layer_properties = 13;
+
+  // The ID of the parent container for this item (if any).  This is a read-only property; changing
+  // it will not change the object's parent
+  // Since: 10.0.6
+  kiapi.common.types.KIID parent = 14;
 }
 
 // An aligned dimension is drawn parallel to the line segment between the start and end points
@@ -891,11 +981,30 @@ message Dimension
   kiapi.common.types.Distance extension_offset = 21;
   DimensionTextPosition text_position = 22;
   bool keep_text_aligned = 23;
+
+  // The ID of the parent container for this item (if any).  This is a read-only property; changing
+  // it will not change the object's parent
+  // Since: 10.0.6
+  kiapi.common.types.KIID parent = 24;
 }
 
 message ReferenceImage
 {
-  // TODO
+  kiapi.common.types.KIID id = 1;
+  BoardLayer layer = 2;
+
+  kiapi.common.types.Vector2 position = 3;
+  kiapi.common.types.Vector2 transform_origin_offset = 4;
+  kiapi.common.types.Ratio image_scale = 5;
+
+  bytes image_data = 6;
+
+  kiapi.common.types.LockedState locked = 7;
+
+  // The ID of the parent container for this item (if any).  This is a read-only property; changing
+  // it will not change the object's parent
+  // Since: 10.0.6
+  kiapi.common.types.KIID parent = 8;
 }
 
 message Group
@@ -903,6 +1012,11 @@ message Group
   kiapi.common.types.KIID id = 1;
   string name = 2;
   repeated kiapi.common.types.KIID items = 3;
+
+  // The ID of the parent container for this item (if any).  This is a read-only property; changing
+  // it will not change the object's parent
+  // Since: 10.0.6
+  kiapi.common.types.KIID parent = 4;
 }
 
 message FieldId
@@ -1043,4 +1157,9 @@ message FootprintInstance
   // or the empty string if there is no associated symbol
   // Since: 9.0.7
   string symbol_footprint_filters = 16;
+
+  // The ID of the parent container for this item (if any).  This is a read-only property; changing
+  // it will not change the object's parent
+  // Since: 10.0.6
+  kiapi.common.types.KIID parent = 17;
 }

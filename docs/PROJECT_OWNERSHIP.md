@@ -52,6 +52,14 @@ paths in the response. Correct the root links and saved symbol metadata together
 before retrying a stale preflight. After a readback failure, inspect the file
 first to avoid adding the same symbol twice.
 
+A stale refusal is bounded rather than per-symbol. `error.reason` names the
+expected instance identity once, counts how many of the sheet's placed symbols
+are stale, and groups them by diagnosis, naming a few symbols and a few distinct
+diagnoses before counting the rest. Symbols that disagree with each other keep
+separate entries, and the instance lists are always given in full — those are
+what a repair has to write back. Read it as prose, not as a parsed list: to
+enumerate every affected symbol, inspect the file.
+
 ## Unreleased notes (next minor release)
 
 Schematics that previously inherited an unrelated ancestor project's libraries,

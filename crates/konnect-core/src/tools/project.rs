@@ -634,7 +634,40 @@ fn blank_kicad_sch() -> String {
 }
 
 fn blank_kicad_pcb() -> &'static str {
-    "(kicad_pcb\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(general\n\t\t(thickness 1.6)\n\t)\n\t(paper \"A4\")\n\t(layers\n\t\t(0 \"F.Cu\" signal)\n\t\t(31 \"B.Cu\" signal)\n\t\t(32 \"B.Adhes\" user \"B.Adhesive\")\n\t\t(33 \"F.Adhes\" user \"F.Adhesive\")\n\t\t(34 \"B.Paste\" user)\n\t\t(35 \"F.Paste\" user)\n\t\t(36 \"B.SilkS\" user \"B.Silkscreen\")\n\t\t(37 \"F.SilkS\" user \"F.Silkscreen\")\n\t\t(38 \"B.Mask\" user)\n\t\t(39 \"F.Mask\" user)\n\t\t(40 \"Dwgs.User\" user \"User.Drawings\")\n\t\t(41 \"Cmts.User\" user \"User.Comments\")\n\t\t(44 \"Edge.Cuts\" user)\n\t\t(45 \"Margin\" user)\n\t\t(46 \"B.CrtYd\" user \"B.Courtyard\")\n\t\t(47 \"F.CrtYd\" user \"F.Courtyard\")\n\t\t(48 \"B.Fab\" user)\n\t\t(49 \"F.Fab\" user)\n\t)\n\t(setup\n\t\t(pad_to_mask_clearance 0.05)\n\t)\n\t(net 0 \"\")\n)\n"
+    concat!(
+        "(kicad_pcb\n",
+        "\t(version 20260206)\n",
+        "\t(generator \"konnect\")\n",
+        "\t(generator_version \"10.0\")\n",
+        "\t(general\n",
+        "\t\t(thickness 1.6)\n",
+        "\t)\n",
+        "\t(paper \"A4\")\n",
+        "\t(layers\n",
+        "\t\t(0 \"F.Cu\" signal)\n",
+        "\t\t(31 \"B.Cu\" signal)\n",
+        "\t\t(32 \"B.Adhes\" user \"B.Adhesive\")\n",
+        "\t\t(33 \"F.Adhes\" user \"F.Adhesive\")\n",
+        "\t\t(34 \"B.Paste\" user)\n",
+        "\t\t(35 \"F.Paste\" user)\n",
+        "\t\t(36 \"B.SilkS\" user \"B.Silkscreen\")\n",
+        "\t\t(37 \"F.SilkS\" user \"F.Silkscreen\")\n",
+        "\t\t(38 \"B.Mask\" user)\n",
+        "\t\t(39 \"F.Mask\" user)\n",
+        "\t\t(40 \"Dwgs.User\" user \"User.Drawings\")\n",
+        "\t\t(41 \"Cmts.User\" user \"User.Comments\")\n",
+        "\t\t(44 \"Edge.Cuts\" user)\n",
+        "\t\t(45 \"Margin\" user)\n",
+        "\t\t(46 \"B.CrtYd\" user \"B.Courtyard\")\n",
+        "\t\t(47 \"F.CrtYd\" user \"F.Courtyard\")\n",
+        "\t\t(48 \"B.Fab\" user)\n",
+        "\t\t(49 \"F.Fab\" user)\n",
+        "\t)\n",
+        "\t(setup\n",
+        "\t\t(pad_to_mask_clearance 0.05)\n",
+        "\t)\n",
+        ")\n",
+    )
 }
 
 #[cfg(test)]
@@ -698,6 +731,16 @@ mod tests {
         assert!(content.contains("\"F.Cu\""));
         assert!(content.contains("\"B.Cu\""));
         assert!(content.contains("\"Edge.Cuts\""));
+    }
+
+    #[test]
+    fn blank_kicad_pcb_uses_the_kicad_10_implicit_net_shape() {
+        let content = blank_kicad_pcb();
+        assert!(content.contains("(version 20260206)"));
+        assert!(
+            !content.contains("\n\t(net "),
+            "KiCad 10 boards must not contain a legacy top-level net table"
+        );
     }
 
     #[test]

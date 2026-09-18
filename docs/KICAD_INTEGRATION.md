@@ -46,6 +46,19 @@ Closed-board move, rotate, and flip in `tools/pcb_components.rs` are narrowly
 scoped exceptions with explicit geometry checks. They are not a general license
 to edit a live board file.
 
+`flip_component` on an *open* board no longer falls into that closed-board
+exception: KiCad 10.0.6 added a native `FlipItems` IPC command, so
+`handle_flip_component` drives it through `attempt_ipc_write` like the other
+live-preferred-with-fallback tools, using the same `FlipItems`-transform KiCad's
+own **F** key applies (including the footprint's 3D-model offset/rotation).
+Older or unsupported KiCad answers `AS_UNHANDLED`, which is reported as a
+structured `unsupported_capability` result rather than falling back to editing
+the file — the file fallback only ever fires when no live KiCad holds the named
+board at all. The closed-board file-fallback path is unchanged and keeps
+refusing any footprint whose 3D model has a non-zero `offset.y`/`rotate.x`/
+`rotate.y`, since reproducing KiCad's own 3D-model flip math for that path
+remains out of scope (issue #604).
+
 ### Editor observation
 
 `konnect-ipc::KiCadIpcClient::observe_editor_state` queries the running KiCad

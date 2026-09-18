@@ -7,8 +7,8 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::sch_connectivity::{label_roots, net_graph_for, pt_key, ConnectivityIndex};
 use crate::tools::{
-    get_path, is_power_symbol_reference, opt_f64, placed_pins_by_reference, require_f64,
-    require_str, ToolContext, ToolDef,
+    get_path, is_power_symbol_reference, opt_f64, opt_positive_f64, placed_pins_by_reference,
+    require_f64, require_str, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -120,12 +120,17 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "trace_from_point",
-            "Trace connectivity from any (X,Y) point — returns what is at that point and the net it belongs to.",
+            "Trace connectivity from any (X,Y) point — returns the wires, labels, component \
+             pins and junction dots at that point, and the net it belongs to. Hierarchical \
+             sheet pins and no-connect flags are not reported, so an empty pins_here does \
+             not prove a wire dangles.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
                     "x": { "type": "number" }, "y": { "type": "number" },
-                    "tolerance": { "type": "number", "default": 0.05 }
+                    "tolerance": {
+                        "type": "number", "exclusiveMinimum": 0, "default": 0.05
+                    }
                 },
                 "required": ["schematic", "x", "y"] }),
             |args, ctx| async move { handle_trace_from_point(args, ctx).await }
@@ -448,7 +453,15 @@ async fn handle_trace_from_point(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let tol = opt_f64(args, "tolerance").unwrap_or(0.05);
+    // A zero or negative tolerance makes every coincidence test below answer
+    // "nothing here" while the net graph, which resolves at its own fixed
+    // tolerance, still names a net — a successful response asserting a net at a
+    // point it also reports as bare. Refused rather than answered, as
+    // `find_orphan_items` refuses it.
+    let tol = match opt_positive_f64(args, "tolerance") {
+        Ok(value) => value.unwrap_or(0.05),
+        Err(e) => return Ok(e),
+    };
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
@@ -467,9 +480,42 @@ async fn handle_trace_from_point(
         .filter(|l| points_coincident(x, y, l.x, l.y, tol))
         .map(|l| json!({ "net": l.net, "type": format!("{:?}", l.kind) }))
         .collect();
-    Ok(CallToolResult::json(
-        &json!({ "x": x, "y": y, "net": g.net_at(x, y), "wires_here": on_wire, "labels_here": at_label }),
-    ))
+    // A pin and a junction dot sit on a point as readily as a wire or a label,
+    // and this is the tool whose whole promise is what is there (#539). Both
+    // come from `ConnectivityIndex`, which owns what attaches at a point: a
+    // second scan here is exactly how the connectivity tools drifted apart
+    // before, and the index is also unit-aware, so a multi-unit symbol
+    // contributes only the unit actually placed (#35).
+    let index = ConnectivityIndex::build(&tree, &wires, &labels, tol);
+    let detail = index.point_detail(x, y);
+    let at_pin: Vec<_> = detail
+        .pins
+        .iter()
+        .map(|placed| {
+            json!({
+                "reference": placed.reference,
+                "pin": placed.pin.number,
+                "pin_name": placed.pin.name,
+                "electrical_type": placed.pin.electrical_type,
+                "x": placed.at.0,
+                "y": placed.at.1
+            })
+        })
+        .collect();
+    let at_junction: Vec<_> = detail
+        .junctions
+        .iter()
+        .map(|&(jx, jy)| json!({ "x": jx, "y": jy }))
+        .collect();
+    Ok(CallToolResult::json(&json!({
+        "x": x,
+        "y": y,
+        "net": g.net_at(x, y),
+        "wires_here": on_wire,
+        "labels_here": at_label,
+        "pins_here": at_pin,
+        "junctions_here": at_junction
+    })))
 }
 
 async fn handle_find_orphan_items(
@@ -1327,12 +1373,13 @@ mod tool_call_support {
     use std::sync::Arc;
 
     /// Run a tool by name against a temp file holding `sch`, exactly as the MCP
-    /// dispatch layer does after selecting its `ToolDef`.
-    pub(super) async fn call(
+    /// dispatch layer does after selecting its `ToolDef`. Returns the result as
+    /// it comes back, so a refusal can be asserted as a refusal.
+    pub(super) async fn call_result(
         sch: &str,
         tool: &str,
         mut args: serde_json::Value,
-    ) -> serde_json::Value {
+    ) -> CallToolResult {
         let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
         f.write_all(sch.as_bytes()).unwrap();
         f.flush().unwrap();
@@ -1343,7 +1390,12 @@ mod tool_call_support {
             ServerConfig::default(),
             Arc::new(crate::router::ToolRouter::new()),
         );
-        let result = (def.handler)(&args, Arc::new(ctx)).await.unwrap();
+        (def.handler)(&args, Arc::new(ctx)).await.unwrap()
+    }
+
+    /// The body of a call that must have succeeded.
+    pub(super) async fn call(sch: &str, tool: &str, args: serde_json::Value) -> serde_json::Value {
+        let result = call_result(sch, tool, args).await;
         assert!(!result.is_error, "{tool} failed");
         let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
             panic!("expected text content");
@@ -1874,5 +1926,191 @@ mod two_name_net_tests {
             .map(|component| component["reference"].as_str().unwrap())
             .collect();
         assert_eq!(components, ["TP9"], "{items}");
+    }
+}
+
+/// What `trace_from_point` reports as being at a point, on the real KiCad
+/// fixture (#539). Wires and labels were already answered; a pin and a junction
+/// dot were not, and there was no empty key to show they had been skipped.
+#[cfg(test)]
+mod trace_from_point_tests {
+    use super::tool_call_support::{call, call_result};
+    use super::*;
+
+    const SCH: &str = include_str!("../../tests/fixtures/trace_point_kicad10.kicad_sch");
+
+    async fn at(x: f64, y: f64) -> serde_json::Value {
+        call(SCH, "trace_from_point", json!({ "x": x, "y": y })).await
+    }
+
+    async fn at_within(x: f64, y: f64, tolerance: serde_json::Value) -> serde_json::Value {
+        call(
+            SCH,
+            "trace_from_point",
+            json!({ "x": x, "y": y, "tolerance": tolerance }),
+        )
+        .await
+    }
+
+    /// The references and pin numbers reported at a point, sorted, so the
+    /// assertion does not depend on the order symbols sit in the file.
+    fn pins(trace: &serde_json::Value) -> Vec<String> {
+        let mut found: Vec<String> = trace["pins_here"]
+            .as_array()
+            .expect("pins_here is always present")
+            .iter()
+            .map(|pin| {
+                format!(
+                    "{}.{}",
+                    pin["reference"].as_str().unwrap(),
+                    pin["pin"].as_str().unwrap()
+                )
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// How many entries a `*_here` key carries. Every one of them is always
+    /// present, so an absent key is a failure rather than a zero.
+    fn count(trace: &serde_json::Value, key: &str) -> usize {
+        trace[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{key} is always present: {trace}"))
+            .len()
+    }
+
+    /// The filed case: `R1` pin 1, two wire ends, a junction dot and net `NETA`
+    /// all at `(100.33, 96.52)`. The net and the wires were already right; the
+    /// pin and the dot were the two the response dropped.
+    #[tokio::test]
+    async fn the_pin_and_the_dot_at_a_point_are_both_reported() {
+        let trace = at(100.33, 96.52).await;
+
+        assert_eq!(trace["net"], "NETA", "{trace}");
+        assert_eq!(count(&trace, "wires_here"), 2, "{trace}");
+        assert_eq!(pins(&trace), ["R1.1"], "{trace}");
+        assert_eq!(count(&trace, "junctions_here"), 1, "{trace}");
+    }
+
+    /// A reported pin carries enough to act on without a second call.
+    #[tokio::test]
+    async fn a_reported_pin_names_itself_and_its_position() {
+        let trace = at(100.33, 96.52).await;
+        let pin = &trace["pins_here"][0];
+
+        assert_eq!(pin["reference"], "R1", "{trace}");
+        assert_eq!(pin["pin"], "1", "{trace}");
+        assert_eq!(pin["electrical_type"], "passive", "{trace}");
+        assert_eq!(pin["x"], 100.33, "{trace}");
+        assert_eq!(pin["y"], 96.52, "{trace}");
+    }
+
+    /// `R1` pin 2, wired but with no dot on it. A pin must not imply a junction.
+    #[tokio::test]
+    async fn a_pin_without_a_dot_reports_no_junction() {
+        let trace = at(100.33, 104.14).await;
+
+        assert_eq!(pins(&trace), ["R1.2"], "{trace}");
+        assert_eq!(count(&trace, "junctions_here"), 0, "{trace}");
+        assert_eq!(count(&trace, "wires_here"), 1, "{trace}");
+    }
+
+    /// A branch landing mid-span: the dot `add_wire` inserts, with no pin under
+    /// it. A junction must not imply a pin either.
+    #[tokio::test]
+    async fn a_dot_without_a_pin_reports_no_pin() {
+        let trace = at(130.81, 121.92).await;
+
+        assert_eq!(count(&trace, "junctions_here"), 1, "{trace}");
+        assert!(pins(&trace).is_empty(), "{trace}");
+        assert_eq!(count(&trace, "wires_here"), 2, "{trace}");
+    }
+
+    /// `R2` pin 2 and `R3` pin 1 sit on one point with no wire between them —
+    /// KiCad's own netlist resolves them as the single net `Net-(R2-Pad2)`.
+    /// Reporting one of them would be the same defect in a smaller form.
+    #[tokio::test]
+    async fn both_of_two_stacked_pins_are_reported() {
+        let trace = at(160.02, 104.14).await;
+
+        assert_eq!(pins(&trace), ["R2.2", "R3.1"], "{trace}");
+    }
+
+    /// Both units of `U1` are placed, 30mm apart. Reading the pins off the
+    /// library symbol rather than the placed unit would put unit 1's pins on
+    /// unit 2's point (#35).
+    #[tokio::test]
+    async fn a_point_on_one_unit_reports_only_that_unit() {
+        let unit_two = at(198.12, 130.81).await;
+        assert_eq!(pins(&unit_two), ["U1.7"], "{unit_two}");
+
+        let unit_one = at(198.12, 100.33).await;
+        assert_eq!(pins(&unit_one), ["U1.1"], "{unit_one}");
+    }
+
+    /// The omission was invisible because no key was there to be empty. On bare
+    /// paper all four lists are present and empty.
+    #[tokio::test]
+    async fn a_bare_point_answers_with_four_empty_lists() {
+        let trace = at(210.0, 50.0).await;
+
+        assert_eq!(trace["net"], serde_json::Value::Null, "{trace}");
+        for key in ["wires_here", "labels_here", "pins_here", "junctions_here"] {
+            assert_eq!(count(&trace, key), 0, "{key} should be empty: {trace}");
+        }
+    }
+
+    /// A tolerance no coincidence test can pass used to be accepted, and the
+    /// response then asserted `net: "NETA"` at a point it reported as bare:
+    /// the net comes from the shared graph, which resolves at its own fixed
+    /// tolerance and never saw the argument. Empty evidence and a named net in
+    /// one successful answer is the contradiction; refusing the argument is the
+    /// fix. `0` is refused too — a point has no zero-width neighbourhood.
+    #[tokio::test]
+    async fn an_unusable_tolerance_is_refused_not_answered_empty() {
+        for tolerance in [json!(0.0), json!(-1.0), json!("wide")] {
+            let result = call_result(
+                SCH,
+                "trace_from_point",
+                json!({ "x": 100.33, "y": 96.52, "tolerance": tolerance }),
+            )
+            .await;
+
+            assert!(result.is_error, "accepted tolerance {tolerance}");
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text content");
+            };
+            let body: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], "tolerance", "{body}");
+            assert!(body.get("net").is_none(), "a refusal names no net: {body}");
+        }
+    }
+
+    /// The refusal is of unusable values, not of the argument: a positive
+    /// tolerance still answers, and the filed point answers the same.
+    #[tokio::test]
+    async fn a_positive_tolerance_is_still_accepted() {
+        let trace = at_within(100.33, 96.52, json!(0.05)).await;
+
+        assert_eq!(trace["net"], "NETA", "{trace}");
+        assert_eq!(pins(&trace), ["R1.1"], "{trace}");
+        assert_eq!(count(&trace, "junctions_here"), 1, "{trace}");
+    }
+
+    /// Pins and dots are read from `ConnectivityIndex` at the tolerance the
+    /// caller asked for, so the same probe 0.02 mm off `R1` pin 1 finds it at
+    /// `0.05` and does not at `0.01`. A scan that hardcoded a tolerance, or an
+    /// index built at one while the probe used another, fails one of these.
+    #[tokio::test]
+    async fn the_requested_tolerance_governs_the_pins_and_dots_reported() {
+        let wide = at_within(100.35, 96.52, json!(0.05)).await;
+        assert_eq!(pins(&wide), ["R1.1"], "{wide}");
+        assert_eq!(count(&wide, "junctions_here"), 1, "{wide}");
+
+        let tight = at_within(100.35, 96.52, json!(0.01)).await;
+        assert!(pins(&tight).is_empty(), "{tight}");
+        assert_eq!(count(&tight, "junctions_here"), 0, "{tight}");
     }
 }

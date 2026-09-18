@@ -952,6 +952,7 @@ fn parse_library_property(
             layer,
             knockout: knockout.unwrap_or(false),
             locked: LockedState::LsUnlocked as i32,
+            parent: None,
         }),
         visible: !hidden.unwrap_or(false),
     }))
@@ -2587,6 +2588,7 @@ mod tests {
             symbol_sheet_name: "Keyboard".to_string(),
             symbol_sheet_filename: "keyboard.kicad_sch".to_string(),
             symbol_footprint_filters: "Test:*".to_string(),
+            parent: None,
         }
     }
 

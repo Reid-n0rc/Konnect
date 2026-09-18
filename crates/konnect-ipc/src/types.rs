@@ -556,3 +556,73 @@ pub struct IpcFieldPlacement {
     /// (x, y, rotation) of the Value text, footprint-local mm/degrees.
     pub value_at: Option<(f64, f64, f64)>,
 }
+
+/// A three-component value as KiCad's `Vector3D` message carries it.
+///
+/// The enclosing field names the quantity and unit. KiCad reuses this wire
+/// shape for unitless scale, rotation in degrees, and offset in millimetres,
+/// so a bare vector must never be exposed without that context.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct IpcVector3 {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+/// A footprint's associated 3D model, as read back from a placed instance.
+/// `flip_footprint` reports these so a caller can independently confirm the
+/// model transform native `FlipItems` applied, without Konnect reimplementing
+/// KiCad's own 3D-model flip math.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcFootprint3DModel {
+    pub filename: String,
+    /// Footprint-local model offset in millimetres.
+    pub offset_mm: IpcVector3,
+    /// Model rotation around each axis in degrees.
+    pub rotation_degrees: IpcVector3,
+    /// Unitless model scale along each axis.
+    pub scale: IpcVector3,
+    pub visible: bool,
+}
+
+/// The result of a `flip_footprint` call against a live KiCad IPC session.
+///
+/// Three outcomes, not two (accepted contract for issue #604): a definite
+/// success (`Flipped`), authoritative evidence that this KiCad build has no
+/// native `FlipItems` handler (`Unsupported`), and a distinct "reconcile
+/// before retrying" state for when the mutation looked like it went through
+/// but a fresh readback could not confirm it (`Uncertain`). A hard failure
+/// (footprint not found, wrong KIID/type, a non-`ISC_OK` per-item status, or
+/// any other rejected request) is not represented here — it is returned as
+/// `Err` and classified by the caller's normal IPC-failure handling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IpcFlipOutcome {
+    /// KiCad flipped the footprint (or it already sat on the requested
+    /// layer, in which case no `FlipItems` call was made at all) and a fresh
+    /// readback — never the mutation response — independently confirmed the
+    /// requested layer and the footprint's identity.
+    Flipped {
+        reference: String,
+        kiid: String,
+        previous_layer: String,
+        layer: String,
+        already_on_layer: bool,
+        models: Vec<IpcFootprint3DModel>,
+    },
+    /// KiCad answered `AS_UNHANDLED`/`AS_UNIMPLEMENTED` for `FlipItems`,
+    /// which the 10.0.6 protocol treats as authoritative capability
+    /// evidence. Never inferred from a version string.
+    Unsupported {
+        kicad_version: Option<IpcKiCadVersion>,
+    },
+    /// The mutation appeared to succeed, but a fresh post-flip readback
+    /// disagreed with it or could not be resolved. The board may or may not
+    /// have changed; the caller must reconcile before retrying rather than
+    /// reporting either success or failure.
+    Uncertain {
+        reference: String,
+        kiid: String,
+        requested_layer: String,
+        reason: String,
+    },
+}

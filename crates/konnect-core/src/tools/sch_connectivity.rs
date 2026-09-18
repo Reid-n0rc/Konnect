@@ -51,10 +51,17 @@ fn bucket(value: f64, tolerance: f64) -> i64 {
 /// Points bucketed at the coincidence tolerance, so a lookup probes nine cells
 /// instead of scanning every point. `points_coincident` compares an L∞ box of
 /// side `tol`, which the 3×3 neighbourhood covers exactly.
+///
+/// Each point keeps the position it was built at, so a caller holding the slice
+/// the index was built from can recover the item itself and not only its
+/// coordinates — see [`ConnectivityIndex::point_detail`].
 struct PointIndex {
     tol: f64,
-    buckets: HashMap<(i64, i64), Vec<(f64, f64)>>,
+    buckets: HashMap<(i64, i64), Vec<IndexedPoint>>,
 }
+
+/// An indexed point: where it is, and the position it was built at.
+type IndexedPoint = (f64, f64, usize);
 
 impl PointIndex {
     fn build(points: impl IntoIterator<Item = (f64, f64)>, tol: f64) -> Self {
@@ -62,9 +69,9 @@ impl PointIndex {
             tol,
             buckets: HashMap::new(),
         };
-        for (x, y) in points {
+        for (ordinal, (x, y)) in points.into_iter().enumerate() {
             let key = index.cell(x, y);
-            index.buckets.entry(key).or_default().push((x, y));
+            index.buckets.entry(key).or_default().push((x, y, ordinal));
         }
         index
     }
@@ -73,26 +80,27 @@ impl PointIndex {
         ((x / self.tol).floor() as i64, (y / self.tol).floor() as i64)
     }
 
+    /// Every indexed point coinciding with `(x, y)`, as `(x, y, build ordinal)`.
+    /// Yielded in bucket order, which is not build order: two coincident points
+    /// can fall in different cells, so a caller that reports them must sort on
+    /// the ordinal rather than inherit whichever cell was probed first.
+    fn hits_at(&self, x: f64, y: f64) -> impl Iterator<Item = IndexedPoint> + '_ {
+        let (cx, cy) = self.cell(x, y);
+        (-1..=1)
+            .flat_map(move |dx| (-1..=1).map(move |dy| (cx + dx, cy + dy)))
+            .filter_map(move |key| self.buckets.get(&key))
+            .flatten()
+            .copied()
+            .filter(move |(px, py, _)| points_coincident(x, y, *px, *py, self.tol))
+    }
+
     /// How many indexed points coincide with `(x, y)`.
     fn count_at(&self, x: f64, y: f64) -> usize {
-        let (cx, cy) = self.cell(x, y);
-        let mut found = 0;
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                let Some(bucket) = self.buckets.get(&(cx + dx, cy + dy)) else {
-                    continue;
-                };
-                found += bucket
-                    .iter()
-                    .filter(|(px, py)| points_coincident(x, y, *px, *py, self.tol))
-                    .count();
-            }
-        }
-        found
+        self.hits_at(x, y).count()
     }
 
     fn contains(&self, x: f64, y: f64) -> bool {
-        self.count_at(x, y) > 0
+        self.hits_at(x, y).next().is_some()
     }
 }
 
@@ -529,6 +537,18 @@ pub(crate) struct PlacedPin {
     pub(crate) at: (f64, f64),
 }
 
+/// The items sitting on one point, rather than the counts and booleans the
+/// attachment predicates ask for. `trace_from_point` is the one tool whose
+/// answer *is* that inventory, so it reads this instead of scanning the tree
+/// again at a tolerance of its own (#539).
+pub(crate) struct PointDetail<'i> {
+    /// Component pins at the point, in the order the sheet places them. One
+    /// entry per pin, so two pins stacked on a point are both here.
+    pub(crate) pins: Vec<&'i PlacedPin>,
+    /// Junction dots at the point, as stored in the file.
+    pub(crate) junctions: Vec<(f64, f64)>,
+}
+
 /// Every item that can terminate a point on one sheet, under one tolerance.
 pub(crate) struct ConnectivityIndex<'a> {
     wires: &'a [Wire],
@@ -591,6 +611,9 @@ impl<'a> ConnectivityIndex<'a> {
                     .map(|label| (label.x, label.y)),
                 tolerance,
             ),
+            // Built from `placed_pins` in order, so a hit's ordinal indexes
+            // straight back into that slice — which is what lets
+            // `point_detail` report the pin and not just its coordinates.
             pin_points: PointIndex::build(placed_pins.iter().map(|p| p.at), tolerance),
             sheet_pin_points: PointIndex::build(sheet_pins, tolerance),
             junction_points: PointIndex::build(junctions, tolerance),
@@ -641,6 +664,35 @@ impl<'a> ConnectivityIndex<'a> {
 
     pub(crate) fn has_label(&self, x: f64, y: f64) -> bool {
         self.label_points.contains(x, y)
+    }
+
+    /// What is on `(x, y)`, item by item: the component pins there and the
+    /// junction dots there, under this index's tolerance. The predicates below
+    /// answer whether a point is attached; this answers what is attached, for
+    /// the tool that has to report it.
+    ///
+    /// Sheet pins and no-connect flags are indexed too but are deliberately not
+    /// returned: `trace_from_point` does not report them, and handing them over
+    /// unused would let the two drift apart silently.
+    pub(crate) fn point_detail(&self, x: f64, y: f64) -> PointDetail<'_> {
+        let mut pins: Vec<(usize, &PlacedPin)> = self
+            .pin_points
+            .hits_at(x, y)
+            .map(|(_, _, ordinal)| (ordinal, &self.placed_pins[ordinal]))
+            .collect();
+        let mut junctions: Vec<(usize, (f64, f64))> = self
+            .junction_points
+            .hits_at(x, y)
+            .map(|(jx, jy, ordinal)| (ordinal, (jx, jy)))
+            .collect();
+        // Bucket order is not file order, and a reported list that reorders
+        // itself with the query point is a list a caller cannot diff.
+        pins.sort_by_key(|(ordinal, _)| *ordinal);
+        junctions.sort_by_key(|(ordinal, _)| *ordinal);
+        PointDetail {
+            pins: pins.into_iter().map(|(_, pin)| pin).collect(),
+            junctions: junctions.into_iter().map(|(_, at)| at).collect(),
+        }
     }
 
     /// How many pins lie at `(x, y)`. A point that is itself a pin counts
@@ -801,6 +853,37 @@ mod agreement_tests {
 
         let components = call("validate_component_connections", &sch, json!({})).await;
         assert_eq!(components["unconnected_count"], 0, "{components}");
+    }
+
+    /// The point the validator called connected is the point `trace_from_point`
+    /// inventories, and both read one index: the pins the decision was made on
+    /// are the pins reported. A second scan of its own is how this tool could
+    /// answer with a set the decision never saw (#539).
+    #[tokio::test]
+    async fn a_traced_point_reports_the_pins_the_validator_judged() {
+        let sch = schematic(&format!(
+            "\t(junction (at 100 80) (uuid \"j1\"))\n{}{}",
+            symbol("U1", "u1", 100.0, 80.0),
+            symbol("U2", "u2", 100.0, 80.0),
+        ));
+
+        let components = call("validate_component_connections", &sch, json!({})).await;
+        assert_eq!(components["unconnected_count"], 0, "{components}");
+
+        let trace = call("trace_from_point", &sch, json!({ "x": 100.0, "y": 80.0 })).await;
+        let mut found: Vec<&str> = trace["pins_here"]
+            .as_array()
+            .expect("pins_here is always present")
+            .iter()
+            .map(|pin| pin["reference"].as_str().unwrap())
+            .collect();
+        found.sort_unstable();
+        assert_eq!(found, ["U1", "U2"], "{trace}");
+        assert_eq!(
+            trace["junctions_here"].as_array().unwrap().len(),
+            1,
+            "{trace}"
+        );
     }
 
     /// A lone pin is unconnected for both tools — the agreement has to hold in

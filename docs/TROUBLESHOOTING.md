@@ -422,3 +422,16 @@ but are not available yet.
 Install via **Plugin and Content Manager → Install from File** with the
 `konnect-pcm-*.zip` release asset (not the bare binary archives), then restart
 KiCAD.
+
+## A board no longer opens after `set_active_layer`
+
+Konnect v0.12.0 could write an unsupported `(active_layer "...")` entry into a
+board's `(setup ...)` block. KiCad 10.0.6 cannot parse that token because the
+active layer belongs to the editor session, not the `.kicad_pcb` document.
+
+Close the board in KiCad, make a backup copy, remove only the injected
+`(active_layer "...")` line from the board file, and reopen the board. Do not
+remove the surrounding `(setup ...)` block. Konnect versions containing the
+fix for #610 refuse `set_active_layer` with `unsupported_capability` and leave
+the file byte-identical until stable KiCad IPC exposes a native operation with
+readback.

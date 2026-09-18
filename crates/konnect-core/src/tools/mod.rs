@@ -2038,6 +2038,27 @@ pub(crate) fn sheet_instance_context(
     })
 }
 
+/// Symbols named per distinct diagnosis before the rest become a count.
+const STALE_IDENTITY_SAMPLE: usize = 3;
+/// Distinct diagnoses spelled out before the rest become a count.
+const STALE_DIAGNOSIS_SAMPLE: usize = 5;
+
+/// Render at most `limit` of `items` with `render` and count the remainder, so
+/// a diagnostic cannot grow with the size of the sheet it describes. Only the
+/// named items are rendered.
+fn join_bounded<T>(items: &[T], limit: usize, render: impl Fn(&T) -> String) -> String {
+    let named = items.len().min(limit);
+    let mut joined = items[..named]
+        .iter()
+        .map(&render)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if items.len() > named {
+        joined.push_str(&format!(" and {} more", items.len() - named));
+    }
+    joined
+}
+
 /// Prove that every existing placed symbol is keyed to exactly the hierarchy
 /// identities observed from the parsed project root.
 ///
@@ -2058,11 +2079,29 @@ pub(crate) fn validate_sheet_instance_state(
         .collect::<Vec<_>>();
     expected.sort();
 
+    // Never sampled. An instance list has one entry per placement of the sheet
+    // in the hierarchy, not one per symbol, so it is not what grew with the
+    // sheet — and it is the list the caller has to write back to clear the
+    // refusal, so an elided entry makes the answer unactionable. It is also the
+    // grouping key below: sampling it would merge symbols that are stale in
+    // genuinely different ways.
+    fn format_paths(paths: &[(String, String)]) -> String {
+        paths
+            .iter()
+            .map(|(project, path)| format!("{project}:{path}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     fn reference_prefix(reference: &str) -> &str {
         reference.trim_end_matches(|character: char| character.is_ascii_digit() || character == '?')
     }
 
-    let mut stale_symbols = Vec::new();
+    // One entry per distinct diagnosis, in first-seen order, each naming the
+    // symbols that share it. The overwhelmingly common stale sheet has every
+    // symbol disagreeing the same way, so it collapses to a single entry.
+    let mut stale_symbols: Vec<(String, Vec<String>)> = Vec::new();
+    let mut grouped: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for symbol in &schematic.symbols {
         let instances = symbol.instances();
         let mut observed = instances
@@ -2094,24 +2133,13 @@ pub(crate) fn validate_sheet_instance_state(
         });
         if malformed || observed != expected || wrong_unit || wrong_reference {
             let identity = symbol_reference.unwrap_or(symbol.uuid.as_str());
-            let format_paths = |paths: &[(String, String)]| {
-                paths
-                    .iter()
-                    .map(|(project, path)| format!("{project}:{path}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
             let mut reasons = Vec::new();
             if malformed {
                 reasons
                     .push("missing or malformed project/path/reference/unit metadata".to_string());
             }
             if observed != expected {
-                reasons.push(format!(
-                    "observed [{}], expected [{}]",
-                    format_paths(&observed),
-                    format_paths(&expected)
-                ));
+                reasons.push(format!("observed [{}]", format_paths(&observed)));
             }
             if wrong_unit {
                 reasons.push(format!(
@@ -2122,22 +2150,53 @@ pub(crate) fn validate_sheet_instance_state(
             if wrong_reference {
                 reasons.push("instance reference identity disagrees with the symbol".to_string());
             }
-            stale_symbols.push(format!("{identity}: {}", reasons.join(", ")));
+            let diagnosis = reasons.join(", ");
+            match grouped.get(&diagnosis) {
+                Some(&index) => stale_symbols[index].1.push(identity.to_string()),
+                None => {
+                    grouped.insert(diagnosis.clone(), stale_symbols.len());
+                    stale_symbols.push((diagnosis, vec![identity.to_string()]));
+                }
+            }
         }
     }
 
     if stale_symbols.is_empty() {
-        Ok(())
-    } else {
-        Err(SchematicTargetError::StaleTarget {
-            target: sch_path.to_path_buf(),
-            reason: format!(
-                "placed-symbol instance metadata disagrees with project '{}': {}",
-                context.project_name,
-                stale_symbols.join("; ")
+        return Ok(());
+    }
+
+    let stale_count = stale_symbols
+        .iter()
+        .map(|(_, identities)| identities.len())
+        .sum::<usize>();
+    let mut diagnoses = stale_symbols
+        .iter()
+        .take(STALE_DIAGNOSIS_SAMPLE)
+        .map(|(diagnosis, identities)| match identities.as_slice() {
+            [identity] => format!("{identity}: {diagnosis}"),
+            _ => format!(
+                "{} ({} symbols): {diagnosis}",
+                join_bounded(identities, STALE_IDENTITY_SAMPLE, String::clone),
+                identities.len()
             ),
         })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let undisclosed = stale_symbols.len().saturating_sub(STALE_DIAGNOSIS_SAMPLE);
+    if undisclosed > 0 {
+        diagnoses.push_str(&format!("; and {undisclosed} further distinct diagnoses"));
     }
+    Err(SchematicTargetError::StaleTarget {
+        target: sch_path.to_path_buf(),
+        reason: format!(
+            "placed-symbol instance metadata disagrees with project '{}': \
+             {stale_count} of {} placed symbols are stale; every symbol must record \
+             exactly [{}]; {diagnoses}",
+            context.project_name,
+            schematic.symbols.len(),
+            format_paths(&expected)
+        ),
+    })
 }
 
 #[cfg(test)]

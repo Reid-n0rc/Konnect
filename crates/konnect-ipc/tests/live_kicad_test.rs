@@ -53,6 +53,7 @@
 //! hand before tagging a release.
 
 use konnect_ipc::client::KiCadIpcClient;
+use konnect_ipc::types::{IpcFlipOutcome, IpcFootprint3DModel};
 use konnect_sexp::{parse_sexp, SexpNode};
 use std::path::Path;
 
@@ -501,6 +502,97 @@ fn moving_and_rotating_footprint_preserves_child_geometry() {
         child_geometry(rotated),
         original_geometry,
         "rotating a footprint must preserve all child-relative geometry"
+    );
+}
+
+fn confirmed_flip(outcome: IpcFlipOutcome) -> (String, Vec<IpcFootprint3DModel>) {
+    match outcome {
+        IpcFlipOutcome::Flipped {
+            layer,
+            models,
+            already_on_layer: _,
+            ..
+        } => (layer, models),
+        other => panic!("expected a confirmed footprint flip, got {other:?}"),
+    }
+}
+
+/// #604 live acceptance: KiCad itself must perform the F.Cu -> B.Cu -> F.Cu
+/// round trip, including a footprint whose model has a non-zero transform.
+/// Mock-server coverage proves the request and response contracts; this test
+/// proves KiCad 10 applies the native operation and that our fresh readback
+/// reports what actually happened without rewriting unrelated footprint data.
+#[test]
+#[ignore = "requires KiCad 10.0.6+ with a disposable board open and IPC enabled"]
+fn native_flip_round_trip_preserves_models_and_unrelated_footprint_content() {
+    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
+        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
+    let reference = std::env::var("KONNECT_LIVE_KICAD_REFERENCE").unwrap_or_else(|_| "P3".into());
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let client = KiCadIpcClient::new(socket);
+
+    client.save_board().expect("initial board save failed");
+    let before_tree = load_board(Path::new(&board));
+    let before = footprint(&before_tree, &reference);
+    let original_pads = pad_offsets(before);
+    let original_geometry = child_geometry(before);
+
+    let (front_layer, original_models) = confirmed_flip(
+        client
+            .flip_footprint(&reference, "F.Cu")
+            .expect("initial model readback failed"),
+    );
+    assert_eq!(front_layer, "F.Cu", "fixture footprint must start on F.Cu");
+    assert!(
+        !original_models.is_empty(),
+        "fixture footprint must carry at least one 3D model"
+    );
+    assert!(
+        original_models.iter().any(|model| {
+            let v = model.offset_mm;
+            let r = model.rotation_degrees;
+            [v.y, r.x, r.y].into_iter().any(|value| value.abs() > 1e-9)
+        }),
+        "fixture must exercise a non-zero model Y offset or X/Y rotation"
+    );
+    eprintln!("F.Cu model readback before flip: {original_models:?}");
+
+    let (back_layer, back_models) = confirmed_flip(
+        client
+            .flip_footprint(&reference, "B.Cu")
+            .expect("front-to-back flip failed"),
+    );
+    assert_eq!(back_layer, "B.Cu");
+    eprintln!("B.Cu model readback after native flip: {back_models:?}");
+    assert_eq!(
+        back_models, original_models,
+        "KiCad 10.0.6 preserves the model's footprint-local transform while the footprint layer supplies the side change"
+    );
+
+    let (restored_layer, restored_models) = confirmed_flip(
+        client
+            .flip_footprint(&reference, "F.Cu")
+            .expect("back-to-front flip failed"),
+    );
+    assert_eq!(restored_layer, "F.Cu");
+    eprintln!("F.Cu model readback after round trip: {restored_models:?}");
+    assert_eq!(
+        restored_models, original_models,
+        "F.Cu -> B.Cu -> F.Cu must restore the model transform exactly"
+    );
+
+    client.save_board().expect("round-trip board save failed");
+    let after_tree = load_board(Path::new(&board));
+    let after = footprint(&after_tree, &reference);
+    assert_eq!(
+        pad_offsets(after),
+        original_pads,
+        "native flip round trip changed unrelated pad positions"
+    );
+    assert_eq!(
+        child_geometry(after),
+        original_geometry,
+        "native flip round trip changed unrelated footprint geometry"
     );
 }
 

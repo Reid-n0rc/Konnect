@@ -166,7 +166,7 @@ and Windows servers do not.
 | `get_pin_net_name` | Return just the net name for a specific pin on a component. |
 | `get_component_nets` | Get all nets connected to every pin of a component. |
 | `get_net_components` | Get all components (and their pins) connected to a named net. |
-| `trace_from_point` | Trace connectivity from any (X,Y) point — returns what is at that point and the net it belongs to. |
+| `trace_from_point` | Trace connectivity from any (X,Y) point — returns the wires, labels, component pins and junction dots at that point, and the net it belongs to. Hierarchical sheet pins and no-connect flags are not reported, so an empty pins_here does not prove a wire dangles. |
 | `find_orphan_items` | Find dangling wire ends, floating labels, and unconnected pin endpoints. Pins, sheet pins, junctions, and no-connect flags all count as connections. |
 | `find_shorted_nets` | Detect accidentally merged nets — distinct net names that KiCad nets together, through a wire path they share or through a name that joins their segments. |
 | `find_single_pin_nets` | Find nets that reach at most one pin — often a missing counterpart, an orphan label, or a stub left by a deleted component. Component pins and hierarchical sheet pins count; a power symbol's own pin names the rail rather than consuming it and does not. Reports the pin and label counts, and every label kind that named the net. Read per sheet: a net a global, hierarchical or power label can carry off this one is flagged cross_sheet_unverified. |
@@ -243,7 +243,7 @@ and Windows servers do not.
 | `get_board_extents` | Return the bounding box of all objects on the board (IPC, falls back to file parse). |
 | `get_layer_list` | Return all layers defined in the board: `id`, `name`, `type`, plus the optional `user_name` label and a `copper` flag. |
 | `add_layer` | Add a new inner copper or technical layer to the board stack. Rejects a non-canonical layer name — KiCad refuses to open a board containing one. Use the canonical name and pass your own label as its user name. |
-| `set_active_layer` | Set the active layer recorded in the board file's setup section. |
+| `set_active_layer` | Return `unsupported_capability` without writing: active layer is editor-session state and the bundled stable KiCad IPC protocol exposes no supported mutation/readback. |
 | `add_board_outline` | Add a rectangular Edge.Cuts outline with sharp or circular rounded corners, identically over IPC and file fallback. Appends — clear the old edges with `delete_graphics` first. |
 | `delete_graphics` | Delete board graphics (lines, rects, arcs, circles, polys, curves, text, textboxes, dimensions) matching a UUID/layer/type filter; `dry_run` lists them instead. |
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position, under the MountingHole library name stock KiCad 10 ships for that drill; a drill with no shipped footprint is refused. |
@@ -261,7 +261,7 @@ and Windows servers do not.
 | `move_component` | Move a placed footprint through live KiCAD IPC when reachable, or use a revision-aware closed-board file fallback. |
 | `rotate_component` | Set a placed footprint's absolute rotation through live KiCAD IPC when reachable, or use a revision-aware closed-board file fallback that updates child angles. |
 | `set_component_placements` | Set X/Y positions and absolute rotations for multiple existing footprints atomically, using one live KiCAD update and one undo step or one revision-aware closed-board write. |
-| `flip_component` | Set a placed footprint to F.Cu or B.Cu on a closed board with KiCAD-equivalent geometry mirroring and revision checks; refuses live-editor races and unsupported geometry. |
+| `flip_component` | Set a placed footprint to F.Cu or B.Cu. On a board open in KiCad 10.0.6+, uses KiCad's native FlipItems IPC command, including the 3D-model transform. Falls back to a revision-aware file edit only when no live KiCad holds the board; an older reachable KiCad returns `unsupported_capability`. The file path refuses unsupported 3D-model geometry. |
 | `delete_component` | Remove a footprint from the board via KiCAD IPC. |
 | `edit_component` | Update the value or other properties of a placed footprint via KiCAD IPC. |
 | `repair_corrupted_footprints` | Dry-run and atomically repair the exact legacy corruption from issue #244: anonymous layerless pads that replaced footprint drawing shapes. Restores the affected shapes from the registered library while preserving live placement, identity, pad nets and non-shape children; apply requires the dry-run revision and is one KiCAD undo commit. |
@@ -283,7 +283,7 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `add_net` | Add a new net entry to the PCB file (S-expression insert, no IPC required). Pre-KiCad-10 boards only: KiCad 10 has no top-level net table, so this fails closed there and points at `route_trace` / `add_via` / `add_copper_pour`, which create a net by naming it on copper. |
+| `add_net` | Idempotently add a net to a pre-KiCad-10 board's top-level net table (S-expression insert, no IPC required). Existing names return their observed ID without writing. KiCad 10 has no top-level net table, so this fails closed there and points at `route_trace` / `add_via` / `add_copper_pour`, which create a net by naming it on copper. |
 | `route_trace` | Route a trace segment between two points on a copper layer via KiCAD IPC. |
 | `route_pad_to_pad` | Route a direct trace between two pads of named components (L-bend routing) via IPC. |
 | `add_via` | Add a through-hole via at a position and assign it to a net via IPC. |

@@ -1118,7 +1118,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "set_active_layer",
-            "Set the active layer recorded in the board file's setup section.",
+            "Request an editor active-layer change. The bundled stable KiCad IPC protocol does not expose this editor-session operation, so this tool currently returns unsupported_capability without modifying the board file. It never writes an (active_layer ...) token because KiCad 10 board files do not support one.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1128,8 +1128,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "layer"]
             }),
             |args, ctx| async move { handle_set_active_layer(args, ctx).await }
-        )
-        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
+        ),
         tool!(
             "add_board_outline",
             "Add a rectangular board outline on Edge.Cuts, optionally using circular rounded \
@@ -1786,32 +1785,82 @@ async fn handle_set_active_layer(
         Err(e) => return Ok(e),
     };
 
-    let content = std::fs::read_to_string(&board_path)?;
-    let new_content = if let Some(pos) = content.find("(active_layer ") {
-        let after = pos + "(active_layer ".len();
-        let close = content[after..].find(')').unwrap_or(0);
-        let layer_end = after + close;
-        apply_edits(
-            content,
-            vec![SexpEdit::replace(after, layer_end, format!("\"{layer}\""))],
-        )
-    } else {
-        // Insert into setup block
-        let setup_close = content
-            .find("(setup")
-            .and_then(|p| content[p..].find('\n').map(|off| p + off))
-            .unwrap_or(content.rfind(')').unwrap_or(content.len()));
-        apply_edits(
-            content,
-            vec![SexpEdit::insert(
-                setup_close,
-                format!("\n    (active_layer \"{layer}\")"),
-            )],
-        )
-    };
-    write_atomic(&board_path, &new_content)?;
+    Ok(CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::UnsupportedCapability {
+            capability: "set_active_layer".to_string(),
+            kicad_version: None,
+        },
+        format!(
+            "Cannot set active layer '{layer}' for '{}': active layer is editor-session state, and the bundled stable KiCad IPC protocol does not expose a supported mutation or readback. The board file was not changed.",
+            board_path.display()
+        ),
+    ))
+}
 
-    Ok(CallToolResult::json(&json!({ "active_layer": layer })))
+#[cfg(test)]
+mod active_layer_refusal_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{BoardAccess, ServerConfig};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        serde_json::from_str(text).expect("structured tool result")
+    }
+
+    #[tokio::test]
+    async fn set_active_layer_is_typed_unsupported_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("safe.kicad_pcb");
+        let original = b"(kicad_pcb\n\t(version 20260206)\n\t(generator \"pcbnew\")\n\t(setup\n\t\t(pad_to_mask_clearance 0)\n\t)\n)\n";
+        std::fs::write(&board, original).unwrap();
+
+        let result = handle_set_active_layer(
+            &json!({"board": board.to_str().unwrap(), "layer": "B.Cu"}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let body = body(&result);
+        assert_eq!(body["error"]["kind"], "unsupported_capability");
+        assert_eq!(body["error"]["capability"], "set_active_layer");
+        assert!(body["message"].as_str().unwrap().contains("not changed"));
+        assert_eq!(std::fs::read(&board).unwrap(), original);
+    }
+
+    #[test]
+    fn set_active_layer_catalogue_discloses_refusal_and_no_file_write_contract() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "set_active_layer")
+            .expect("registered tool");
+
+        assert_eq!(tool.board_access, BoardAccess::None);
+        assert!(tool.description.contains("unsupported_capability"));
+        assert!(tool.description.contains("never writes"));
+        assert!(!tool.description.contains("recorded in the board file"));
+    }
 }
 
 async fn handle_add_board_outline(

@@ -21,12 +21,16 @@ connection communicates with the running KiCAD instance in real-time.
 
 Some board-construction and component tools have guarded closed-board paths. IPC-first
 tools fall back to the file only when the transport is unreachable and the target board
-has not been observed live during this server session. File-only operations such as
-`flip_component` proceed only when KiCad does not hold the target board open. These
-paths use revision-aware atomic writes: placement preserves pads, graphics, attributes,
-and models; moves preserve the existing angle; rotations update the footprint and its
-child angles; flips mirror supported geometry and swap front/back layers. A reachable
-KiCad rejection stays closed instead of racing the editor.
+has not been observed live during this server session. These paths use revision-aware
+atomic writes: placement preserves pads, graphics, attributes, and models; moves
+preserve the existing angle; rotations update the footprint and its child angles; the
+closed-board flip fallback mirrors supported geometry and swaps front/back layers,
+refusing any 3D model whose offset/rotation it cannot transform. On KiCad 10.0.6+,
+`flip_component` prefers KiCad's own native FlipItems IPC command instead, which
+handles that 3D-model transform correctly — the file fallback only applies when no
+live KiCad holds the board. A reachable KiCad that predates 10.0.6 returns
+the structured error **unsupported_capability**; every reachable rejection stays closed instead of racing
+the editor with a file edit.
 
 `unsafe_file_fallback` is a stop condition. It means Konnect reached this board live
 earlier in the current server session but IPC is now unreachable, so the saved file may
@@ -134,7 +138,7 @@ Do NOT add copper pours before routing is complete — they interfere with inter
 | `update_footprints_from_library` | Refresh placed definitions from linked libraries |
 | `move_component`          | Relocate a footprint via IPC or safe file fallback |
 | `rotate_component`        | Rotate a footprint via IPC or safe file fallback |
-| `flip_component`          | Set F.Cu/B.Cu on a closed board with geometry mirroring |
+| `flip_component`          | Set F.Cu/B.Cu via native IPC (KiCad 10.0.6+) or safe file fallback |
 | `align_components`        | Align multiple components (top/bottom/left/right/center) |
 | `place_component_array`   | Grid placement for repeated elements        |
 

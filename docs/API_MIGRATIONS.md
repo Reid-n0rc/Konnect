@@ -3,6 +3,50 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `set_active_layer` refuses instead of corrupting KiCad 10 boards
+
+`set_active_layer` previously inserted an `(active_layer "...")` entry into the
+board's `(setup ...)` block. KiCad 10.0.6 does not support that document token:
+active layer is editor-session state, and a board containing the inserted entry
+cannot be loaded.
+
+The tool now returns a structured `unsupported_capability` error and leaves the
+board byte-identical. There is no supported replacement call in the bundled
+stable KiCad IPC protocol. If v0.12.0 already changed a board, close it, make a
+backup, remove only the injected `(active_layer "...")` line, and reopen it.
+See [Troubleshooting](TROUBLESHOOTING.md#a-board-no-longer-opens-after-set_active_layer).
+
+## Unreleased: a stale-target refusal is bounded, not one line per symbol (patch release)
+
+Every mutating schematic tool preflights placed-symbol instance metadata. When
+that check refused, `error.reason` carried one `"{reference}: observed [...],
+expected [...]"` line per stale symbol. A sheet goes stale as a whole — copy a
+`.kicad_sch` to a new filename stem and every symbol records the old project
+name — so the answer repeated one fact once per symbol: 18 535 B of `reason` and
+a 37 301 B response for a 46-symbol sheet, growing linearly with the sheet (#592).
+
+`reason` now names the expected instance identity once, states how many of the
+sheet's placed symbols are stale, and groups the symbols by their diagnosis,
+naming at most three symbols and five distinct diagnoses before counting the
+rest. Instance lists themselves are never sampled — an elided path is one the
+caller cannot write back:
+
+```text
+placed-symbol instance metadata disagrees with project 'demo': 46 of 46 placed
+symbols are stale; every symbol must record exactly [demo:/<root>/<sheet>];
+RV201, C201, R203 and 43 more (46 symbols): observed [old:/<root>/<sheet>]
+```
+
+The same sheet now answers in 1 373 B. Symbols that disagree with each other
+keep separate entries, so a mixed sheet still names each distinct failure.
+
+The guard itself is unchanged: the same documents are refused, `error.kind`
+stays `stale_target`, `error.target` is unchanged, and nothing is written. Only
+the `reason` text — and the `message` that interpolates it — is shorter. Callers
+matching on `error.kind` need no change; a caller parsing individual symbols out
+of `reason` should read the sampled identities and counts instead, or inspect
+the file. `reason` remains prose for a human or a model, not a parsed field.
+
 ## Unreleased: explicit live-board synchronization for CLI DRC
 
 `run_drc` and `get_drc_violations` accept `sync_live_board: false` and
@@ -115,6 +159,43 @@ free number for a prefix (a gap between `R1` and `R3` is filled; before, the
 next number was always the maximum plus one), and `#`-prefixed designators
 spelled `#PWR01`, `#PWR010`, `#PWR0100` as eeschema spells them (before:
 `#PWR1`). Both places a designator lives are written.
+
+## Unreleased: `trace_from_point` reports pins and junctions (minor release)
+
+`trace_from_point`'s answer to "what is at this point" listed wires and labels
+only. A component pin and a junction dot at the same coordinate were omitted,
+and no `pins_here` or `junctions_here` key was present to be empty, so a caller
+could not tell the two had been skipped (#539).
+
+The response gains two arrays, always present:
+
+- `pins_here` — every placed pin at the point, each carrying `reference`,
+  `pin`, `pin_name`, `electrical_type`, `x` and `y`, spelled as
+  `find_orphan_items` already spells them. Pins stacked on one point are all
+  reported. Only the unit actually placed contributes, so a multi-unit symbol
+  never answers with another unit's pins.
+- `junctions_here` — every junction dot at the point, as `x`/`y`.
+
+`x`, `y`, `net`, `wires_here` and `labels_here` are unchanged in name, shape
+and content, and the `tolerance` argument governs the two new arrays exactly as
+it governs the existing ones. A caller that reads only the old keys is
+unaffected; one that treated the absence of `pins_here` as "no pin here" was
+reading a key that never existed.
+
+`tolerance` is now declared `exclusiveMinimum: 0` and refused with a structured
+`invalid_argument` when it is zero, negative or not a number — previously any
+value was accepted. `tolerance: -1` used to answer successfully with `net`
+named and all four `*_here` arrays empty: the net comes from the shared net
+graph, which resolves at its own fixed tolerance and never saw the argument, so
+the response asserted a net at a point it also reported as bare. The argument
+still does not reach `net`; what changes is that a value which can only produce
+empty evidence is no longer answered. `find_orphan_items` already refused the
+same input.
+
+Hierarchical sheet pins and no-connect flags can also sit on a point and are
+still not reported. The tool description now names the four kinds it does
+report, and says so, rather than promising "what is at that point" in the
+abstract.
 
 ## Unreleased: tool input schemas are enforced at dispatch (patch release)
 
@@ -853,3 +934,44 @@ identical without it.
 
 These removals narrow the schema to behavior Konnect can verify. They do not change
 the generated files or analysis because the removed values had no implementation.
+
+## Unreleased: `flip_component` on an open board uses KiCad 10.0.6's native `FlipItems`
+
+`flip_component` previously refused unconditionally whenever KiCad was
+reachable, because the vendored IPC protocol had no footprint-flip command
+(#604). KiCad 10.0.6 added a native `FlipItems` command, so a board that is
+open live in KiCad **10.0.6 or newer** now flips through that command inside
+one KiCad undo transaction — the same transform the GUI's **F** key performs,
+including the footprint's 3D-model offset/rotation — and reports
+`"source": "ipc"`. Konnect never saves the board on this path.
+
+A reachable KiCad older than 10.0.6 (or any endpoint without the handler)
+answers `AS_UNHANDLED`; Konnect reports this as a structured
+`unsupported_capability` error naming the observed KiCad version and the
+10.0.6 requirement, rather than falling back to editing the file. A mutation
+that appears to succeed but whose fresh post-flip readback cannot confirm the
+result returns a distinct `mutation_outcome_uncertain` error instead of either
+success or a plain failure — inspect the board in KiCad and reconcile before
+retrying.
+
+The **closed-board** file fallback is unchanged and only reachable when no
+live KiCad holds the named board at all: it keeps refusing any footprint whose
+3D model carries a non-zero `offset.y`, `rotate.x`, or `rotate.y`, since
+reproducing KiCad's own 3D-model flip transform for that path remains out of
+scope. `flip_component`'s tool description and `BoardAccess` classification
+changed from "requires a closed board" to live-preferred-with-fallback to
+reflect this; existing closed-board callers are unaffected.
+
+## Unreleased: `add_net` is idempotent on legacy boards
+
+`add_net` now returns an existing legacy net's observed numeric ID without
+writing when the requested name is already declared. Its JSON response adds a
+`created` boolean so callers can distinguish a new insertion from an idempotent
+no-op. New declarations use the board's newline convention, canonical tab
+indentation, escaped S-expression text, and an ID one greater than the highest
+observed top-level declaration.
+
+KiCad 10 boards still refuse the operation before writing because they have no
+top-level numeric net table. That refusal is now the structured
+`unsupported_capability` kind. Create a KiCad 10 net by naming it on a pad or
+copper item instead.

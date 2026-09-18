@@ -2700,6 +2700,235 @@ impl KiCadIpcClient {
         anyhow::bail!("Footprint '{}' not found", reference)
     }
 
+    /// The 3D models a placed footprint carries, read straight off its
+    /// `definition.items`. Used only for readback evidence — `flip_footprint`
+    /// never computes or writes a model transform itself; that is native
+    /// KiCad's job via `FlipItems`.
+    fn footprint_3d_models(
+        fp: &kiapi::board::types::FootprintInstance,
+    ) -> Result<Vec<crate::types::IpcFootprint3DModel>> {
+        let definition = fp
+            .definition
+            .as_ref()
+            .context("footprint readback has no definition, so its 3D models are unknown")?;
+        definition
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| crate::builders::any_is(item, "kiapi.board.types.Footprint3DModel"))
+            .map(|(index, item)| {
+                let model = kiapi::board::types::Footprint3DModel::decode(item.value.as_slice())
+                    .with_context(|| {
+                        format!("3D model {index} is not valid Footprint3DModel evidence")
+                    })?;
+                let vector = |value: Option<kiapi::common::types::Vector3D>, field: &str| {
+                    value
+                        .map(|value| crate::types::IpcVector3 {
+                            x: value.x_nm,
+                            y: value.y_nm,
+                            z: value.z_nm,
+                        })
+                        .with_context(|| format!("3D model {index} has no {field} readback"))
+                };
+                Ok(crate::types::IpcFootprint3DModel {
+                    filename: model.filename,
+                    offset_mm: vector(model.offset, "offset_mm")?,
+                    rotation_degrees: vector(model.rotation, "rotation_degrees")?,
+                    scale: vector(model.scale, "scale")?,
+                    visible: model.visible,
+                })
+            })
+            .collect()
+    }
+
+    /// Flip a placed footprint to `target_layer` ("F.Cu" or "B.Cu") using
+    /// KiCad 10.0.6's native `FlipItems` command, when the board is open live
+    /// in KiCad.
+    ///
+    /// Implements the contract accepted for issue #604:
+    ///
+    /// * The footprint is resolved by reference to its live KIID first —
+    ///   reference is discovery input, KIID is mutation identity, exactly
+    ///   like [`Self::move_footprint`].
+    /// * Already on the requested layer → a readback-derived no-op; no
+    ///   `FlipItems` call is made.
+    /// * Otherwise `FlipItems` is sent with `BFD_TOP_BOTTOM` (the same
+    ///   Y-coordinate reflection the closed-board file fallback performs)
+    ///   inside one KiCad commit/undo transaction. This method never saves.
+    /// * The protocol explicitly allows an envelope `IRS_OK` even when zero
+    ///   items were flipped, so that status is never treated as proof.
+    ///   Success requires exactly one `flipped_items` entry whose status is
+    ///   `ISC_OK` and whose returned item is a `FootprintInstance` carrying
+    ///   the requested KIID.
+    /// * After the mutation, a *fresh* read (never the mutation response)
+    ///   independently confirms the target layer, identity, and the
+    ///   footprint's 3D-model state.
+    /// * `AS_UNHANDLED`/`AS_UNIMPLEMENTED` is authoritative evidence that
+    ///   this KiCad build predates native `FlipItems`, never inferred from a
+    ///   version string.
+    pub fn flip_footprint(
+        &self,
+        reference: &str,
+        target_layer: &str,
+    ) -> Result<crate::types::IpcFlipOutcome> {
+        use crate::types::IpcFlipOutcome;
+
+        let target_board_layer = crate::builders::layer_from_name(target_layer);
+        let (fp, _) = self.find_footprint_instance(reference)?;
+        let kiid = fp
+            .id
+            .as_ref()
+            .map(|id| id.value.clone())
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("footprint '{reference}' has no KIID to flip"))?;
+        let previous_layer = layer_enum_to_name(fp.layer).to_string();
+
+        if fp.layer == target_board_layer as i32 {
+            return Ok(IpcFlipOutcome::Flipped {
+                reference: reference.to_string(),
+                kiid,
+                previous_layer: previous_layer.clone(),
+                layer: previous_layer,
+                already_on_layer: true,
+                models: Self::footprint_3d_models(&fp)?,
+            });
+        }
+
+        let flip_kiid = kiid.clone();
+        let commit_result = self.run_commit("Flip footprint", move |client| {
+            let doc = client.get_board_document()?;
+            let header = header_for(doc);
+            let cmd = kiapi::board::commands::FlipItems {
+                header: Some(header),
+                items: vec![kiapi::common::types::Kiid {
+                    value: flip_kiid.clone(),
+                }],
+                direction: kiapi::board::commands::BoardFlipDirection::BfdTopBottom as i32,
+            };
+            let response_any = client.send_command(&cmd, "kiapi.board.commands.FlipItems")?;
+            let response: kiapi::board::commands::FlipItemsResponse =
+                unpack_required(response_any, "FlipItems")?;
+
+            // The 10.0.6 protocol explicitly permits IRS_OK with zero flipped
+            // items (board_commands.proto, FlipItemsResponse.status doc
+            // comment) — envelope success is never, by itself, proof.
+            if response.flipped_items.len() != 1 {
+                anyhow::bail!(
+                    "KiCad returned {} flip results for 1 requested item",
+                    response.flipped_items.len()
+                );
+            }
+            let result = &response.flipped_items[0];
+            let status = result
+                .status
+                .as_ref()
+                .context("KiCad returned a flip result without an item status")?;
+            if status.code() != kiapi::common::commands::ItemStatusCode::IscOk {
+                anyhow::bail!(
+                    "KiCad footprint flip failed: {} ({})",
+                    status.error_message,
+                    status.code().as_str_name()
+                );
+            }
+            let item_any = result
+                .item
+                .as_ref()
+                .context("KiCad returned an ISC_OK flip result without an item")?;
+            if !crate::builders::any_is(item_any, "kiapi.board.types.FootprintInstance") {
+                anyhow::bail!(
+                    "KiCad returned a flip result of unexpected type '{}'",
+                    crate::builders::any_type_name(item_any)
+                );
+            }
+            let flipped =
+                kiapi::board::types::FootprintInstance::decode(item_any.value.as_slice())
+                    .context("KiCad returned an unreadable flipped footprint")?;
+            let returned_kiid = flipped.id.as_ref().map(|k| k.value.as_str()).unwrap_or("");
+            if returned_kiid != flip_kiid {
+                anyhow::bail!(
+                    "KiCad flipped item '{returned_kiid}' does not match requested KIID '{flip_kiid}'"
+                );
+            }
+            Ok(())
+        });
+
+        if let Err(error) = commit_result {
+            if let Some(status) = ApiStatusError::from_error(&error) {
+                if status.is_unsupported() {
+                    let kicad_version = self.get_kicad_version().ok();
+                    return Ok(IpcFlipOutcome::Unsupported { kicad_version });
+                }
+            }
+            return Err(error);
+        }
+
+        // Fresh readback — never the mutation response — is the only
+        // evidence that counts for the final layer, identity and 3D-model
+        // state (accepted #604 contract).
+        let (readback_fp, _) = match self.find_footprint_instance(reference) {
+            Ok(found) => found,
+            Err(error) => {
+                return Ok(IpcFlipOutcome::Uncertain {
+                    reference: reference.to_string(),
+                    kiid,
+                    requested_layer: target_layer.to_string(),
+                    reason: format!(
+                        "post-flip readback could not resolve the footprint: {error:#}"
+                    ),
+                });
+            }
+        };
+        let readback_kiid = readback_fp
+            .id
+            .as_ref()
+            .map(|id| id.value.as_str())
+            .unwrap_or("");
+        if readback_kiid != kiid {
+            return Ok(IpcFlipOutcome::Uncertain {
+                reference: reference.to_string(),
+                kiid,
+                requested_layer: target_layer.to_string(),
+                reason: format!(
+                    "post-flip readback KIID '{readback_kiid}' does not match requested KIID"
+                ),
+            });
+        }
+        if readback_fp.layer != target_board_layer as i32 {
+            return Ok(IpcFlipOutcome::Uncertain {
+                reference: reference.to_string(),
+                kiid,
+                requested_layer: target_layer.to_string(),
+                reason: format!(
+                    "post-flip readback reports layer '{}', not the requested '{target_layer}'",
+                    layer_enum_to_name(readback_fp.layer)
+                ),
+            });
+        }
+
+        let models = match Self::footprint_3d_models(&readback_fp) {
+            Ok(models) => models,
+            Err(error) => {
+                return Ok(IpcFlipOutcome::Uncertain {
+                    reference: reference.to_string(),
+                    kiid,
+                    requested_layer: target_layer.to_string(),
+                    reason: format!(
+                        "post-flip readback could not establish 3D-model state: {error:#}"
+                    ),
+                });
+            }
+        };
+
+        Ok(IpcFlipOutcome::Flipped {
+            reference: reference.to_string(),
+            kiid,
+            previous_layer,
+            layer: layer_enum_to_name(readback_fp.layer).to_string(),
+            already_on_layer: false,
+            models,
+        })
+    }
+
     /// Rotate a footprint to a new angle.
     pub fn rotate_footprint(&self, reference: &str, angle: f64) -> Result<()> {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
@@ -3050,6 +3279,7 @@ impl KiCadIpcClient {
                     }) as i32,
                     knockout: false,
                     locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+                    parent: None,
                 }),
                 visible,
             }

@@ -1582,13 +1582,15 @@ fn flip_pad_block(block: &str) -> anyhow::Result<String> {
 
 /// Refuse a `(model …)` whose placement a flip would have to move.
 ///
-/// KiCad's own flip transforms a model's Y offset and its X/Y rotation; this
-/// tool leaves `(model …)` untouched, which is silently wrong for any model
-/// where those are non-zero. Rather than guess the transform — I have not been
-/// able to measure KiCad's flip directly, because KiCad 10.0.5 exposes no
-/// `FlipItems` to drive it and its demo boards contain no back-side footprint
-/// with a non-zero offset to compare against — this refuses, consistent with
-/// how the rest of this path treats geometry it cannot mirror.
+/// This guard applies only to the closed-board file-fallback path. An open
+/// board flips through KiCad's own native `FlipItems` IPC command (10.0.6+),
+/// which transforms a model's Y offset and X/Y rotation correctly, so that
+/// path never reaches this function. The closed-board path directly edits
+/// the `.kicad_pcb` file and leaves `(model …)` untouched, which is silently
+/// wrong for any model where those are non-zero. Rather than guess the
+/// transform — reproducing KiCad's own `FOOTPRINT::Flip` 3D-model math is out
+/// of scope for the file fallback (issue #604) — this refuses, consistent
+/// with how the rest of this path treats geometry it cannot mirror.
 ///
 /// The cost of refusing is close to nothing. Across all **14,818** footprints
 /// in KiCad 10's standard libraries that carry a `(model …)`: `offset.y` is
@@ -1904,9 +1906,14 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "flip_component",
-            "Set a placed footprint to F.Cu or B.Cu with KiCAD-equivalent geometry mirroring. \
-             This operation requires a closed board: it safely flips supported footprints with \
-             revision checks and fails closed when KiCAD is reachable or geometry is unsupported.",
+            "Set a placed footprint to F.Cu or B.Cu. When the board is open in KiCad 10.0.6 or \
+             newer, this uses KiCad's own native FlipItems IPC command — the same transform the \
+             GUI's F key performs, including 3D-model offset/rotation — inside one KiCad undo \
+             step. Older or unsupported KiCad reachable over IPC returns an explicit \
+             unsupported_capability error rather than falling back to the file. Only when no \
+             live KiCad holds this board does it fall back to a guarded closed-board file edit, \
+             which flips supported geometry with revision checks and refuses any footprint whose \
+             3D model would need a transform the file path cannot perform.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1918,7 +1925,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_flip_component(args, ctx).await }
         )
-        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "delete_component",
             "Remove a footprint from the board via KiCAD IPC.",
@@ -2516,6 +2523,12 @@ async fn handle_set_component_placements(
     }
 }
 
+/// Minimum KiCad version whose native `FlipItems` command Konnect drives over
+/// IPC (issue #604). Older reachable KiCad answers `AS_UNHANDLED`, which this
+/// handler treats as authoritative capability evidence, never inferred from a
+/// version string on its own.
+const FLIP_ITEMS_MIN_KICAD_VERSION: &str = "10.0.6";
+
 async fn handle_flip_component(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -2539,41 +2552,89 @@ async fn handle_flip_component(
         Err(error) => return Ok(error),
     };
 
-    // KiCAD 10.0.5 and the protocol Konnect vendors carry no FlipItems command,
-    // so this tool has no IPC implementation at all — which makes
-    // `refuse_if_board_open_in_kicad` the right gate rather than
-    // `attempt_ipc_write`.
-    //
-    // The distinction is not cosmetic. Running `ensure_board_is_active` and
-    // then bailing unconditionally produced an `anyhow` classified as
-    // `Rejected` — so *every* reachable KiCAD refused the flip, including one
-    // holding an unrelated project, where this board file is demonstrably
-    // free. It also reported Konnect's own refusal as "KiCAD rejected the
-    // footprint flip over IPC", which is the class fixed in v0.5.0. That
-    // misclassification is now gone at the source: "not open" carries the
-    // `BoardNotOpen` marker and classifies as its own answer.
-    //
-    // The helper refuses only when KiCAD holds *this* board, because that is
-    // the only case where the edit would be discarded by its next save.
-    //
-    if let Some(refusal) =
-        crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "footprint flip")
-            .await?
+    // KiCad 10.0.6 added a native FlipItems IPC command, so an open board now
+    // flips through the same live-IPC-preferred-with-fallback shape as
+    // set_component_placements, rather than refusing outright whenever KiCad
+    // is reachable. The closed-board file fallback is unchanged (issue #604).
+    let reference_ipc = reference.clone();
+    let layer_ipc = layer.clone();
+    match attempt_ipc_write(ctx, &board, "footprint flip", move |client| {
+        client.flip_footprint(&reference_ipc, &layer_ipc)
+    })
+    .await?
     {
-        return Ok(refusal);
+        BoardWrite::Ipc(outcome) => Ok(flip_outcome_result(outcome)),
+        BoardWrite::Refused(result) => Ok(result),
+        BoardWrite::File(reason) => {
+            match set_closed_board_footprint_side(&board, &reference, &layer) {
+                Ok(changed) => Ok(CallToolResult::json(&json!({
+                    "flipped": reference,
+                    "layer": layer,
+                    "changed": changed,
+                    "source": "file",
+                    "fallback_reason": reason.evidence(),
+                    "warning": reason.warning()
+                }))),
+                Err(error) => Ok(error.into_result()),
+            }
+        }
     }
+}
 
-    match set_closed_board_footprint_side(&board, &reference, &layer) {
-        Ok(changed) => Ok(CallToolResult::json(&json!({
+/// Turn a [`konnect_ipc::IpcFlipOutcome`] into the tool's `CallToolResult`.
+///
+/// `Flipped` is the only case reported as a plain success. `Unsupported` and
+/// `Uncertain` are both IPC-observed states — the board is open and
+/// reachable — so neither one may fall back to the file path; each gets its
+/// own structured result naming what the caller should do next.
+fn flip_outcome_result(outcome: konnect_ipc::IpcFlipOutcome) -> CallToolResult {
+    use konnect_ipc::IpcFlipOutcome;
+    match outcome {
+        IpcFlipOutcome::Flipped {
+            reference,
+            kiid,
+            previous_layer,
+            layer,
+            already_on_layer,
+            models,
+        } => CallToolResult::json(&json!({
             "flipped": reference,
+            "kiid": kiid,
+            "previous_layer": previous_layer,
             "layer": layer,
-            "changed": changed,
-            "source": "file",
-            "warning": "KiCAD has no footprint-flip command over IPC, so the board file was \
-                        flipped directly with a revision check. Reopen the board in KiCAD to \
-                        see it."
-        }))),
-        Err(error) => Ok(error.into_result()),
+            "already_on_layer": already_on_layer,
+            "models": models,
+            "source": "ipc",
+            "undo": "One KiCad undo step reverses the flip."
+        })),
+        IpcFlipOutcome::Unsupported { kicad_version } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::UnsupportedCapability {
+                capability: "flip_component".to_string(),
+                kicad_version: kicad_version.map(|v| v.full_version),
+            },
+            format!(
+                "The running KiCad endpoint answered AS_UNHANDLED for the native footprint-flip \
+                 command. Konnect requires KiCad {FLIP_ITEMS_MIN_KICAD_VERSION} or newer to flip \
+                 a footprint on an open board over IPC. The board file was not modified."
+            ),
+        ),
+        IpcFlipOutcome::Uncertain {
+            reference,
+            kiid,
+            requested_layer,
+            reason,
+        } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::MutationOutcomeUncertain {
+                operation: "flip_component".to_string(),
+                path: format!("{reference} ({kiid})"),
+                reason: reason.clone(),
+            },
+            format!(
+                "KiCad's footprint-flip mutation for '{reference}' toward {requested_layer} may \
+                 or may not have taken effect: {reason}. Inspect the board in KiCad and reconcile \
+                 before retrying — this may not be a no-op."
+            ),
+        ),
     }
 }
 
@@ -5258,7 +5319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reachable_rejection_prevents_flip_file_fallback() {
+    async fn a_reachable_kicad_that_rejects_the_flip_never_touches_the_file() {
         let tmp = tempfile::tempdir().unwrap();
         let board = tmp.path().join("flip.kicad_pcb");
         let before = format!(
@@ -5295,17 +5356,375 @@ mod tests {
         .await
         .unwrap();
 
-        // A KiCAD that answers but does not confirm holding *this* board does
-        // not block the flip: nothing it has open can discard a write to this
-        // file, so refusing would deny a safe edit to anyone with an unrelated
-        // project open. That is `refuse_if_board_open_in_kicad`'s contract,
-        // shared with `add_zone` and the copper-pour path.
-        assert!(!flipped.is_error, "{:?}", flipped.content);
-        let result: serde_json::Value =
-            serde_json::from_str(&result_text(&flipped)).expect("flip result must be JSON");
-        assert_eq!(result["source"], "file");
-        assert_eq!(result["changed"], true);
-        assert_ne!(std::fs::read_to_string(board).unwrap(), before);
+        // Since #604, flip_component performs the write over IPC via
+        // attempt_ipc_write, exactly like set_component_placements: a
+        // reachable KiCad that answers but rejects the request may be alive
+        // and holding this exact board, so the file must not be touched —
+        // "Rejected" fails closed rather than falling back to the file
+        // (mirrors `a_reachable_kicad_that_rejects_never_touches_the_file`).
+        assert!(
+            flipped.is_error,
+            "a rejection must not be reported as success"
+        );
+        let text = result_text(&flipped);
+        assert!(
+            text.contains("rejected the footprint flip") && text.contains("not modified"),
+            "the error must say the file was left alone: {text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            before,
+            "a reachable KiCAD that says no must never trigger the file fallback"
+        );
+    }
+
+    /// A rep0 endpoint playing a KiCad that holds `board` open with one
+    /// footprint on it, answering `GetItems`/`BeginCommit`/`EndCommit`/
+    /// `GetVersion`, and dispatching `FlipItems` to `flip_items`. Exercises
+    /// `handle_flip_component`'s IPC path end-to-end through
+    /// `attempt_ipc_write` (issue #604) — not just `flip_footprint` in
+    /// isolation, which `flip_footprint_test.rs` already covers.
+    fn spawn_flip_capable_kicad(
+        board: &std::path::Path,
+        footprint: std::sync::Arc<
+            std::sync::Mutex<konnect_ipc::gen::kiapi::board::types::FootprintInstance>,
+        >,
+        flip_items: impl Fn(
+                &konnect_ipc::gen::kiapi::board::commands::FlipItems,
+                &mut konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+            ) -> konnect_ipc::gen::kiapi::board::commands::FlipItemsResponse
+            + Send
+            + 'static,
+    ) -> crate::test_support::MockIpcServer {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+
+        let board = board.to_string_lossy().to_string();
+        crate::test_support::MockIpcServer::spawn("flip-capable-kicad", move |request| {
+            let command = request.message.expect("a command");
+            let body = if command.type_url.ends_with("GetOpenDocuments") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetOpenDocumentsResponse {
+                        documents: vec![kiapi::common::types::DocumentSpecifier {
+                            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                            project: None,
+                            identifier: Some(
+                                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                    board.clone(),
+                                ),
+                            ),
+                        }],
+                    },
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                ))
+            } else if command.type_url.ends_with("GetItems") {
+                let fp = footprint.lock().unwrap().clone();
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: vec![konnect_ipc::builders::pack_any(
+                            &fp,
+                            "kiapi.board.types.FootprintInstance",
+                        )],
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ))
+            } else if command.type_url.ends_with("BeginCommit") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::BeginCommitResponse {
+                        id: Some(kiapi::common::types::Kiid {
+                            value: "flip-commit".to_string(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                ))
+            } else if command.type_url.ends_with("EndCommit") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::EndCommitResponse {},
+                    "kiapi.common.commands.EndCommitResponse",
+                ))
+            } else if command.type_url.ends_with("kiapi.board.commands.FlipItems") {
+                let flip =
+                    kiapi::board::commands::FlipItems::decode(command.value.as_slice()).unwrap();
+                let mut held = footprint.lock().unwrap();
+                let response = flip_items(&flip, &mut held);
+                Some(konnect_ipc::builders::pack_any(
+                    &response,
+                    "kiapi.board.commands.FlipItemsResponse",
+                ))
+            } else if command.type_url.ends_with("GetVersion") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetVersionResponse {
+                        version: Some(kiapi::common::types::KiCadVersion {
+                            major: 10,
+                            minor: 0,
+                            patch: 5,
+                            full_version: "10.0.5".to_string(),
+                        }),
+                    },
+                    "kiapi.common.commands.GetVersionResponse",
+                ))
+            } else {
+                None
+            };
+            kiapi::common::ApiResponse {
+                status: Some(kiapi::common::ApiResponseStatus {
+                    status: kiapi::common::ApiStatusCode::AsOk as i32,
+                    error_message: String::new(),
+                }),
+                header: None,
+                message: body,
+            }
+        })
+    }
+
+    fn flip_test_footprint(
+        kiid: &str,
+        layer: konnect_ipc::gen::kiapi::board::types::BoardLayer,
+    ) -> konnect_ipc::gen::kiapi::board::types::FootprintInstance {
+        use konnect_ipc::gen::kiapi;
+        kiapi::board::types::FootprintInstance {
+            id: Some(kiapi::common::types::Kiid {
+                value: kiid.to_string(),
+            }),
+            position: Some(konnect_ipc::builders::vec2(10.0, 20.0)),
+            orientation: Some(kiapi::common::types::Angle { value_degrees: 0.0 }),
+            layer: layer as i32,
+            reference_field: Some(kiapi::board::types::Field {
+                name: "Reference".to_string(),
+                text: Some(kiapi::board::types::BoardText {
+                    text: Some(kiapi::common::types::Text {
+                        text: "U1".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            definition: Some(kiapi::board::types::Footprint {
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn flip_over_ipc_succeeds_when_kicad_holds_this_exact_board() {
+        use konnect_ipc::gen::kiapi;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("flip.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb\n  (version 20260206)\n)\n").unwrap();
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let footprint = std::sync::Arc::new(std::sync::Mutex::new(flip_test_footprint(
+            "U1-kiid",
+            kiapi::board::types::BoardLayer::BlFCu,
+        )));
+        let server = spawn_flip_capable_kicad(&board, footprint, |flip, held| {
+            assert_eq!(
+                flip.direction(),
+                kiapi::board::commands::BoardFlipDirection::BfdTopBottom
+            );
+            held.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
+            let item = konnect_ipc::builders::pack_any(held, "kiapi.board.types.FootprintInstance");
+            kiapi::board::commands::FlipItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                flipped_items: vec![kiapi::board::commands::ItemFlipResult {
+                    status: Some(kiapi::common::commands::ItemStatus {
+                        code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                        error_message: String::new(),
+                    }),
+                    item: Some(item),
+                }],
+            }
+        });
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+
+        let result = handle_flip_component(
+            &json!({"board": board, "reference": "U1", "layer": "B.Cu"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body: serde_json::Value =
+            serde_json::from_str(&result_text(&result)).expect("json result");
+        assert_eq!(body["source"], "ipc");
+        assert_eq!(body["layer"], "B.Cu");
+        assert_eq!(body["flipped"], "U1");
+        // The IPC path never touches the file.
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn flip_over_ipc_reports_unsupported_capability_on_as_unhandled() {
+        use konnect_ipc::gen::kiapi;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("flip.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb\n  (version 20260206)\n)\n").unwrap();
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let footprint = std::sync::Arc::new(std::sync::Mutex::new(flip_test_footprint(
+            "U1-kiid",
+            kiapi::board::types::BoardLayer::BlFCu,
+        )));
+        let board_for_mock = board.clone();
+        let server =
+            crate::test_support::MockIpcServer::spawn("flip-unsupported", move |request| {
+                let command = request.message.expect("a command");
+                let body = if command.type_url.ends_with("GetOpenDocuments") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![kiapi::common::types::DocumentSpecifier {
+                            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                            project: None,
+                            identifier: Some(
+                                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                    board_for_mock.to_string_lossy().to_string(),
+                                ),
+                            ),
+                        }],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    ))
+                } else if command.type_url.ends_with("GetItems") {
+                    let fp = footprint.lock().unwrap().clone();
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items: vec![konnect_ipc::builders::pack_any(
+                                &fp,
+                                "kiapi.board.types.FootprintInstance",
+                            )],
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ))
+                } else if command.type_url.ends_with("BeginCommit") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::BeginCommitResponse {
+                            id: Some(kiapi::common::types::Kiid {
+                                value: "flip-commit".to_string(),
+                            }),
+                        },
+                        "kiapi.common.commands.BeginCommitResponse",
+                    ))
+                } else if command.type_url.ends_with("EndCommit") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    ))
+                } else if command.type_url.ends_with("GetVersion") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetVersionResponse {
+                            version: Some(kiapi::common::types::KiCadVersion {
+                                major: 10,
+                                minor: 0,
+                                patch: 5,
+                                full_version: "10.0.5".to_string(),
+                            }),
+                        },
+                        "kiapi.common.commands.GetVersionResponse",
+                    ))
+                } else if command.type_url.ends_with("kiapi.board.commands.FlipItems") {
+                    // AS_UNHANDLED: 10.0.5 predates the native FlipItems handler.
+                    return kiapi::common::ApiResponse {
+                        status: Some(kiapi::common::ApiResponseStatus {
+                            status: kiapi::common::ApiStatusCode::AsUnhandled as i32,
+                            error_message: "FlipItems is not handled".to_string(),
+                        }),
+                        header: None,
+                        message: None,
+                    };
+                } else {
+                    None
+                };
+                kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: body,
+                }
+            });
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+
+        let result = handle_flip_component(
+            &json!({"board": board, "reference": "U1", "layer": "B.Cu"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.is_error,
+            "AS_UNHANDLED must not be reported as success"
+        );
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("unsupported_capability")
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result_text(&result)).expect("json error body");
+        assert_eq!(parsed["error"]["kicad_version"], "10.0.5");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn flip_over_ipc_reports_uncertain_outcome_when_readback_disagrees() {
+        use konnect_ipc::gen::kiapi;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("flip.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb\n  (version 20260206)\n)\n").unwrap();
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let footprint = std::sync::Arc::new(std::sync::Mutex::new(flip_test_footprint(
+            "U1-kiid",
+            kiapi::board::types::BoardLayer::BlFCu,
+        )));
+        // The mutation response claims success and a new layer, but the mock
+        // never actually updates `held` — so the fresh readback GetItems that
+        // follows still reports F.Cu. This is exactly the divergence the
+        // readback guard exists to catch (issue #604 acceptance criteria).
+        let server = spawn_flip_capable_kicad(&board, footprint, |_flip, held| {
+            let mut echoed = held.clone();
+            echoed.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
+            let item =
+                konnect_ipc::builders::pack_any(&echoed, "kiapi.board.types.FootprintInstance");
+            kiapi::board::commands::FlipItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                flipped_items: vec![kiapi::board::commands::ItemFlipResult {
+                    status: Some(kiapi::common::commands::ItemStatus {
+                        code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                        error_message: String::new(),
+                    }),
+                    item: Some(item),
+                }],
+            }
+        });
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+
+        let result = handle_flip_component(
+            &json!({"board": board, "reference": "U1", "layer": "B.Cu"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "an unconfirmed mutation is not a success");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
     }
 
     #[tokio::test]

@@ -210,6 +210,7 @@ pub fn build_track(
         locked: kiapi::common::types::LockedState::LsUnlocked as i32,
         layer: layer_from_name(layer) as i32,
         net: Some(net(net_name, net_code)),
+        parent: None,
     }
 }
 
@@ -236,6 +237,7 @@ pub fn build_track_arc(
         locked: kiapi::common::types::LockedState::LsUnlocked as i32,
         layer: layer_from_name(layer) as i32,
         net: Some(net(net_name, net_code)),
+        parent: None,
     }
 }
 
@@ -297,6 +299,7 @@ pub fn build_via(
         locked: kiapi::common::types::LockedState::LsUnlocked as i32,
         net: Some(net(net_name, net_code)),
         r#type: ViaType::VtThrough as i32,
+        parent: None,
     }
 }
 
@@ -403,6 +406,7 @@ pub fn build_zone(spec: &ZoneSpec<'_>, net_code: i32) -> kiapi::board::types::Zo
         locked: kiapi::common::types::LockedState::LsUnlocked as i32,
         layer_properties: vec![],
         settings: Some(kiapi::board::types::zone::Settings::CopperSettings(copper)),
+        parent: None,
     }
 }
 
@@ -488,6 +492,7 @@ fn board_shape(
         net: None,
         id: None, // KiCAD assigns
         locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+        parent: None,
     }
 }
 
@@ -687,6 +692,7 @@ pub fn board_text_with_stroke_width(
         layer: layer_from_name(layer) as i32,
         knockout: false,
         locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+        parent: None,
     }
 }
 

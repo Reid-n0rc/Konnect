@@ -792,9 +792,12 @@ mod tests {
             registered.get("place_component"),
             Some(&konnect_core::tools::BoardAccess::LivePreferredWithFallback)
         );
+        // #604: flip_component now prefers KiCad 10.0.6's native live-IPC
+        // FlipItems, with the closed-board file edit as its guarded fallback
+        // — the pre-pcb-fallback hook's own guidance, not pre-pcb-closed's.
         assert_eq!(
             registered.get("flip_component"),
-            Some(&konnect_core::tools::BoardAccess::ClosedBoardOnly)
+            Some(&konnect_core::tools::BoardAccess::LivePreferredWithFallback)
         );
         assert_eq!(
             registered.get("plan_bga_fanout"),

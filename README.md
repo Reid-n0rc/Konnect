@@ -302,10 +302,11 @@ the main workspace — see [DEV.md](DEV.md) for build steps.
   tracked on the [roadmap](ROADMAP.md))
 - `kicad-cli` (ships with KiCAD — used for exports, ERC, DRC)
 - For most PCB tools: KiCAD running with the target board open (IPC API).
-  `place_component`, `move_component`, and `rotate_component` can safely fall
-  back to a closed board file when IPC is unreachable. `flip_component`
-  intentionally requires a closed board because KiCAD IPC has no native
-  footprint-flip command.
+  `place_component`, `move_component`, `rotate_component`, and (on KiCAD
+  10.0.6+) `flip_component` can safely fall back to a closed board file when
+  IPC is unreachable. An older reachable KiCAD makes `flip_component` fail
+  closed with `unsupported_capability`; it never edits the file underneath a
+  live editor that cannot perform the native flip.
 
 ## License: free for the little guys
 
@@ -344,9 +345,10 @@ manual copy), then restart KiCAD.
 with that board first; most PCB tools talk to the running PCB editor. Only an
 unreachable KiCAD produces that message: if KiCAD is running and the tool
 refuses anyway, the error is the tool's own reason for refusing.
-`place_component`, `move_component`, and `rotate_component` can fall back to a
-closed board file when no KiCAD process is reachable; `flip_component`
-requires one, and refuses while KiCAD holds that board open.
+`place_component`, `move_component`, `rotate_component`, and (on KiCAD
+10.0.6+) `flip_component` can fall back to a closed board file when no KiCAD
+process is reachable. An older, reachable KiCAD makes `flip_component` refuse
+rather than silently editing the file underneath it.
 
 See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for socket setup, tools
 that don't appear after `load_toolset`, and transaction recovery.

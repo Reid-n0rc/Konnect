@@ -1012,6 +1012,217 @@ mod reliability_contract_dispatch_tests {
 }
 
 #[cfg(test)]
+mod active_layer_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    #[tokio::test]
+    async fn set_active_layer_refusal_survives_served_dispatch_without_writing() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("safe.kicad_pcb");
+        let original = b"(kicad_pcb\n\t(version 20260206)\n\t(generator \"pcbnew\")\n\t(setup\n\t\t(pad_to_mask_clearance 0)\n\t)\n)\n";
+        std::fs::write(&board, original).unwrap();
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 610,
+                "method": "tools/call",
+                "params": {
+                    "name": "set_active_layer",
+                    "arguments": {
+                        "board": board.display().to_string(),
+                        "layer": "B.Cu"
+                    }
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("JSON-RPC tool result");
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        let body: Value = serde_json::from_str(text).expect("tool body is JSON");
+
+        assert_eq!(body["error"]["kind"], "unsupported_capability");
+        assert_eq!(body["error"]["capability"], "set_active_layer");
+        assert_eq!(std::fs::read(&board).unwrap(), original);
+    }
+}
+
+#[cfg(test)]
+mod current_board_template_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    #[tokio::test]
+    async fn create_project_board_is_refused_by_add_net_without_writing() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+
+        let create = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 631,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_project",
+                    "arguments": {
+                        "path": dir.path().display().to_string(),
+                        "name": "current"
+                    }
+                }
+            }))
+            .await
+            .expect("create_project returns a response");
+        let create_result = create.result.expect("JSON-RPC tool result");
+        assert_ne!(create_result["isError"], true, "{create_result}");
+
+        let board = dir.path().join("current.kicad_pcb");
+        let original = std::fs::read(&board).expect("created board");
+        let original_text = std::str::from_utf8(&original).unwrap();
+        assert!(original_text.contains("(version 20260206)"));
+        assert!(!original_text.contains("\n\t(net "));
+
+        let add_net = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 632,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_net",
+                    "arguments": {
+                        "board": board.display().to_string(),
+                        "net_name": "PROBE_NET"
+                    }
+                }
+            }))
+            .await
+            .expect("add_net returns a response");
+        let add_net_result = add_net.result.expect("JSON-RPC tool result");
+        assert_eq!(add_net_result["isError"], true, "{add_net_result}");
+        let error_body: Value = serde_json::from_str(
+            add_net_result["content"][0]["text"]
+                .as_str()
+                .expect("tool returns JSON text"),
+        )
+        .expect("tool body is JSON");
+        assert_eq!(error_body["error"]["kind"], "unsupported_capability");
+        assert!(
+            error_body["message"]
+                .as_str()
+                .is_some_and(|text| text.contains("KiCad 10")),
+            "{error_body}"
+        );
+        assert_eq!(
+            std::fs::read(&board).unwrap(),
+            original,
+            "the refused operation must not change the generated board"
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_add_net_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::path::Path;
+
+    fn body(response: JsonRpcResponse) -> Value {
+        let result = response.result.expect("JSON-RPC tool result");
+        assert_ne!(result["isError"], true, "{result}");
+        serde_json::from_str(
+            result["content"][0]["text"]
+                .as_str()
+                .expect("tool returns JSON text"),
+        )
+        .expect("tool body is JSON")
+    }
+
+    async fn call_add_net(handler: &McpHandler, board: &Path, name: &str) -> Value {
+        body(
+            handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 631,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "add_net",
+                        "arguments": {
+                            "board": board.display().to_string(),
+                            "net_name": name
+                        }
+                    }
+                }))
+                .await
+                .expect("add_net returns a response"),
+        )
+    }
+
+    #[tokio::test]
+    async fn served_add_net_is_idempotent_and_reaches_the_board_logic() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("legacy.kicad_pcb");
+        let original = b"(kicad_pcb\n\t(version 20241229)\n\t(net 0 \"\")\n\t(net 7 \"GND\")\n)\n";
+        std::fs::write(&board, original).unwrap();
+
+        let existing = call_add_net(&handler, &board, "GND").await;
+        assert_eq!(existing["net_id"], 7);
+        assert_eq!(existing["created"], false);
+        assert_eq!(std::fs::read(&board).unwrap(), original);
+
+        let created = call_add_net(&handler, &board, "PROBE_NET").await;
+        assert_eq!(created["net_id"], 8);
+        assert_eq!(created["created"], true);
+        let after_create = std::fs::read(&board).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&after_create)
+                .matches("\"PROBE_NET\"")
+                .count(),
+            1
+        );
+
+        let repeated = call_add_net(&handler, &board, "PROBE_NET").await;
+        assert_eq!(repeated["net_id"], 8);
+        assert_eq!(repeated["created"], false);
+        assert_eq!(std::fs::read(&board).unwrap(), after_create);
+    }
+}
+
+#[cfg(test)]
 mod annotate_dispatch_tests {
     use super::*;
     use crate::tools::ServerConfig;

@@ -319,6 +319,10 @@ async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Re
     let mut cmd = Command::new(&exe);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
+    #[cfg(test)]
+    let child = test_support::spawn_cli(&mut cmd)
+        .with_context(|| format!("Failed to spawn kicad-cli: {}", cli))?;
+    #[cfg(not(test))]
     let child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn kicad-cli: {}", cli))?;
@@ -477,6 +481,36 @@ async fn publish_verified_files(
 pub(crate) mod test_support {
     use super::*;
 
+    // Linux returns ETXTBSY (errno 26) when a parallel test forks while a
+    // freshly written fake CLI still has a writer inherited across the fork.
+    // Production never executes a file it just created, so keep this bounded
+    // mitigation inside test support rather than hiding real kicad-cli errors.
+    const ETXTBSY_RAW_OS_ERROR: i32 = 26;
+    const TEST_CLI_SPAWN_ATTEMPTS: usize = 5;
+    const TEST_CLI_SPAWN_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+    fn spawn_with_executable_busy_retry<T>(
+        mut spawn: impl FnMut() -> std::io::Result<T>,
+        mut pause: impl FnMut(Duration),
+    ) -> std::io::Result<T> {
+        for attempt in 1..=TEST_CLI_SPAWN_ATTEMPTS {
+            match spawn() {
+                Err(error)
+                    if error.raw_os_error() == Some(ETXTBSY_RAW_OS_ERROR)
+                        && attempt < TEST_CLI_SPAWN_ATTEMPTS =>
+                {
+                    pause(TEST_CLI_SPAWN_RETRY_DELAY);
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the final spawn attempt always returns")
+    }
+
+    pub(crate) fn spawn_cli(cmd: &mut Command) -> std::io::Result<tokio::process::Child> {
+        spawn_with_executable_busy_retry(|| cmd.spawn(), std::thread::sleep)
+    }
+
     pub(crate) fn write_script(
         dir: &Path,
         stem: &str,
@@ -521,6 +555,77 @@ pub(crate) mod test_support {
             "#!/bin/sh\nif [ \"$1\" = \"sch\" ]; then\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"--output\" ]; then\n      shift\n      printf '%s' 'PDF-test' > \"$1\"\n      break\n    fi\n    shift\n  done\nfi\nexit 0\n",
             "@echo off\r\nif not \"%1\"==\"sch\" exit /b 0\r\n:loop\r\nif \"%1\"==\"\" goto done\r\nif not \"%1\"==\"--output\" goto next\r\nshift\r\necho PDF-test>\"%1\"\r\ngoto done\r\n:next\r\nshift\r\ngoto loop\r\n:done\r\nexit /b 0\r\n",
         )
+    }
+
+    #[test]
+    fn fake_cli_spawn_retries_only_executable_busy_errors() {
+        let mut attempts = 0;
+        let mut pauses = Vec::new();
+        let result = spawn_with_executable_busy_retry(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(std::io::Error::from_raw_os_error(26))
+                } else {
+                    Ok("spawned")
+                }
+            },
+            |delay| pauses.push(delay),
+        );
+
+        assert_eq!(result.unwrap(), "spawned");
+        assert_eq!(attempts, 3);
+        assert_eq!(pauses.len(), 2);
+
+        let mut other_attempts = 0;
+        let other_error = spawn_with_executable_busy_retry(
+            || -> std::io::Result<()> {
+                other_attempts += 1;
+                Err(std::io::Error::from_raw_os_error(2))
+            },
+            |_| panic!("non-ETXTBSY errors must not be retried"),
+        )
+        .unwrap_err();
+        assert_eq!(other_error.raw_os_error(), Some(2));
+        assert_eq!(other_attempts, 1);
+
+        let mut busy_attempts = 0;
+        let mut busy_pauses = 0;
+        let busy_error = spawn_with_executable_busy_retry(
+            || -> std::io::Result<()> {
+                busy_attempts += 1;
+                Err(std::io::Error::from_raw_os_error(ETXTBSY_RAW_OS_ERROR))
+            },
+            |_| busy_pauses += 1,
+        )
+        .unwrap_err();
+        assert_eq!(busy_error.raw_os_error(), Some(ETXTBSY_RAW_OS_ERROR));
+        assert_eq!(busy_attempts, TEST_CLI_SPAWN_ATTEMPTS);
+        assert_eq!(busy_pauses, TEST_CLI_SPAWN_ATTEMPTS - 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fake_cli_spawn_survives_a_real_executable_busy_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = write_script(
+            dir.path(),
+            "temporarily-busy-kicad-cli",
+            "#!/bin/sh\nprintf 'ready'\n",
+            "",
+        );
+        let writer = std::fs::OpenOptions::new().write(true).open(&cli).unwrap();
+        let release_writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(15));
+            drop(writer);
+        });
+
+        let output = run_cli(cli.to_str().unwrap(), &[], Duration::from_secs(1))
+            .await
+            .expect("the fake CLI should start after the inherited writer closes");
+        release_writer.join().unwrap();
+
+        assert_eq!(output, "ready");
     }
 }
 

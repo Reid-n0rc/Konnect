@@ -10,7 +10,7 @@ use crate::tools::{
     get_path, opt_f64, require_f64, require_str, with_board_ipc_classified, ToolContext, ToolDef,
 };
 use anyhow::Context;
-use konnect_sexp::writer::{apply_edits, write_atomic, SexpEdit};
+use konnect_sexp::writer::{apply_edits, write_atomic, write_atomic_if_unchanged, SexpEdit};
 use prost::Message;
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
@@ -42,10 +42,11 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "add_net",
-            "Add a new net entry to the top-level net table of a pre-KiCad-10 board \
-             (S-expression insert, no KiCAD IPC required). Fails on a KiCad 10 board, which \
-             has no net table — there, name the net on copper (route_trace, add_via, \
-             add_copper_pour) instead.",
+            "Idempotently add a net to the top-level net table of a pre-KiCad-10 board \
+             (S-expression insert, no KiCAD IPC required). An existing name returns its \
+             observed ID without writing. Fails on a KiCad 10 board, which has no net \
+             table — there, name the net on copper (route_trace, add_via, add_copper_pour) \
+             instead.",
             json!({
                 "type": "object",
                 "properties": {
@@ -320,37 +321,73 @@ async fn handle_add_net(
     let tree = konnect_sexp::parse_sexp(&content)?;
 
     if board_is_kicad_10(&tree) {
-        return Ok(CallToolResult::error(format!(
-            "Cannot add net '{net_name}' to this board: it is in the KiCad 10 format, which has \
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::UnsupportedCapability {
+                capability: "legacy_top_level_net_table".to_string(),
+                kicad_version: Some("10".to_string()),
+            },
+            format!(
+                "Cannot add net '{net_name}' to this board: it is in the KiCad 10 format, which has \
              no top-level net table. A net exists only by being named on an item — \
              (net \"{net_name}\") on a pad, segment, via or zone — so there is nothing for a \
              file-level insert to add, and appending a net node would report success while \
              KiCad discarded it on load. Create the net by naming it on copper instead: \
              route_trace / add_via / add_copper_pour take a net_name, as does assigning a pad \
              in KiCad. get_nets_list reads the live net list over IPC."
-        )));
+            ),
+        ));
     }
 
     // Pre-KiCad-10: the top-level table is real, so an insert is meaningful.
     // The next id is one past the highest in use — not the number of "(net "
     // occurrences in the file, which counted every reference on every pad,
     // segment and zone and so collided with existing ids almost immediately.
-    let net_id = tree
-        .find_all("net")
-        .iter()
-        .filter_map(|n| konnect_sexp::net::net_id(n))
-        .filter_map(|id| id.parse::<i32>().ok())
-        .max()
-        .map(|max| max + 1)
-        .unwrap_or(1);
-    let net_sexp = format!("\n  (net {net_id} \"{net_name}\")");
+    let declarations = tree
+        .children()
+        .into_iter()
+        .flatten()
+        .filter(|node| node.head() == Some("net"));
+    let mut highest_id = 0_i64;
+    for declaration in declarations {
+        let Some(id) =
+            konnect_sexp::net::net_id(declaration).and_then(|value| value.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        highest_id = highest_id.max(id);
+        if konnect_sexp::net::net_name(declaration) == Some(net_name.as_str()) {
+            return Ok(CallToolResult::json(&json!({
+                "net_id": id,
+                "net_name": net_name,
+                "created": false
+            })));
+        }
+    }
+    let net_id = highest_id.checked_add(1).context("net ID overflow")?;
+    let escaped_name = net_name
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    let eol = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     // Insert before the last closing paren
     let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, net_sexp)]);
-    write_atomic(&board_path, &new_content)?;
+    let prefix = if content[..close_pos].ends_with(eol) {
+        ""
+    } else {
+        eol
+    };
+    let net_sexp = format!("{prefix}\t(net {net_id} \"{escaped_name}\"){eol}");
+    let new_content = apply_edits(content.clone(), vec![SexpEdit::insert(close_pos, net_sexp)]);
+    write_atomic_if_unchanged(&board_path, &content, &new_content)?;
 
     Ok(CallToolResult::json(
-        &json!({ "net_id": net_id, "net_name": net_name }),
+        &json!({ "net_id": net_id, "net_name": net_name, "created": true }),
     ))
 }
 
@@ -2040,6 +2077,10 @@ mod add_net_format_tests {
             \t(segment (start 0 0) (end 1 0) (net \"GND\"))\n)\n";
         let (result, after) = add_net_to(board).await;
         assert!(result.is_error, "must fail closed: {}", text_of(&result));
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("unsupported_capability")
+        );
         let msg = text_of(&result);
         assert!(msg.contains("KiCad 10"), "{msg}");
         assert!(msg.contains("route_trace"), "must point somewhere: {msg}");
@@ -2062,7 +2103,49 @@ mod add_net_format_tests {
         let board = "(kicad_pcb\n  (version 20241229)\n  (net 0 \"\")\n  (net 1 \"GND\")\n)\n";
         let (result, after) = add_net_to(board).await;
         assert!(!result.is_error, "{}", text_of(&result));
-        assert!(after.contains("(net 2 \"NEWNET\")"), "{after}");
+        assert_eq!(
+            after,
+            "(kicad_pcb\n  (version 20241229)\n  (net 0 \"\")\n  (net 1 \"GND\")\n\t(net 2 \"NEWNET\")\n)\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_legacy_net_returns_its_id_without_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("board.kicad_pcb");
+        let original = "(kicad_pcb\n\t(version 20241229)\n\t(net 0 \"\")\n\t(net 7 \"GND\")\n)\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = handle_add_net(
+            &json!({ "board": path.to_str().unwrap(), "net_name": "GND" }),
+            &test_ctx(),
+        )
+        .await
+        .expect("handler should return");
+        assert!(!result.is_error, "{}", text_of(&result));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(body["net_id"], 7);
+        assert_eq!(body["created"], false);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn a_new_legacy_net_escapes_its_name_and_preserves_crlf() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("board.kicad_pcb");
+        let original = "(kicad_pcb\r\n\t(version 20241229)\r\n\t(net 0 \"\")\r\n)\r\n";
+        std::fs::write(&path, original).unwrap();
+        let result = handle_add_net(
+            &json!({ "board": path.to_str().unwrap(), "net_name": "A\\\"B" }),
+            &test_ctx(),
+        )
+        .await
+        .expect("handler should return");
+        assert!(!result.is_error, "{}", text_of(&result));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "(kicad_pcb\r\n\t(version 20241229)\r\n\t(net 0 \"\")\r\n\t(net 1 \"A\\\\\\\"B\")\r\n)\r\n"
+        );
     }
 
     /// The old id was `content.matches("(net ").count()`, which counted every
