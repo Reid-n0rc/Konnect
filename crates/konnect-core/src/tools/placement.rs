@@ -2462,6 +2462,48 @@ mod tests {
         );
     }
 
+    /// Served `tools/call` coverage (not a direct handler call) for #594's
+    /// `outline_unproven` verdict, over the same real-KiCad concave `gr_poly`
+    /// fixture used above.
+    #[tokio::test]
+    async fn served_score_placement_reports_outline_unproven_for_a_non_rectangular_board() {
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 594,
+                "method": "tools/call",
+                "params": {
+                    "name": "score_placement",
+                    "arguments": { "board": GR_POLY_FIXTURE }
+                }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+
+        assert_eq!(response["isError"], json!(false), "{body}");
+        assert_eq!(body["outline_missing"], false, "{body}");
+        assert_eq!(body["outline_unproven"], true, "{body}");
+        assert_eq!(body["outline_shape"], "unproven", "{body}");
+        assert_eq!(body["verdict"], "outline_unproven", "{body}");
+        assert_ne!(body["verdict"], "pass");
+    }
+
     /// Move ONE footprint's root anchor by string surgery on the
     /// KiCad-authored fixture, the way
     /// `overlapping_courtyards_are_a_hard_fail_naming_the_pair` does: the
@@ -3618,6 +3660,128 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(std::fs::read(&board).unwrap(), before, "must not mutate");
+    }
+
+    /// Served `tools/call` coverage (not a direct handler call) for #594's
+    /// planner refusal: `auto_place_from_schematic` must refuse an unproven
+    /// outline through the real MCP dispatch layer, for both `dry_run` and
+    /// `apply`, and the apply attempt must leave the board byte-identical.
+    #[tokio::test]
+    async fn served_auto_place_refuses_an_unproven_outline_and_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("gr_poly.kicad_pcb");
+        std::fs::copy(GR_POLY_FIXTURE, &board).unwrap();
+        let before = std::fs::read(&board).unwrap();
+
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let call = |id, dry_run| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "auto_place_from_schematic",
+                    "arguments": { "board": board.to_string_lossy(), "dry_run": dry_run }
+                }
+            })
+        };
+
+        for (id, dry_run) in [(5940, true), (5941, false)] {
+            let response = handler
+                .handle_message(call(id, dry_run))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+
+            assert_eq!(
+                response["isError"],
+                json!(true),
+                "dry_run={dry_run}: {body}"
+            );
+            assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+            assert_eq!(body["error"]["operation"], "auto_place_from_schematic");
+            assert_eq!(
+                std::fs::read(&board).unwrap(),
+                before,
+                "dry_run={dry_run}: an unproven-outline refusal must not write"
+            );
+        }
+    }
+
+    /// Served twin of `served_auto_place_refuses_an_unproven_outline_and_does_not_write`
+    /// for `refine_placement_force_directed`, the other planner that shares
+    /// the same `outline_unproven_refusal` helper.
+    #[tokio::test]
+    async fn served_force_directed_refuses_an_unproven_outline_and_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("gr_poly.kicad_pcb");
+        std::fs::copy(GR_POLY_FIXTURE, &board).unwrap();
+        let before = std::fs::read(&board).unwrap();
+
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let call = |id, dry_run| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "refine_placement_force_directed",
+                    "arguments": { "board": board.to_string_lossy(), "dry_run": dry_run }
+                }
+            })
+        };
+
+        for (id, dry_run) in [(5942, true), (5943, false)] {
+            let response = handler
+                .handle_message(call(id, dry_run))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+
+            assert_eq!(
+                response["isError"],
+                json!(true),
+                "dry_run={dry_run}: {body}"
+            );
+            assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+            assert_eq!(
+                body["error"]["operation"],
+                "refine_placement_force_directed"
+            );
+            assert_eq!(
+                std::fs::read(&board).unwrap(),
+                before,
+                "dry_run={dry_run}: an unproven-outline refusal must not write"
+            );
+        }
     }
 
     #[tokio::test]
