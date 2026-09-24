@@ -185,6 +185,27 @@ after its own plan, so a change is judged before it is made:
    `score_placement` nor the planners implement true polygon/arc/cutout
    containment, so a non-rectangular board's real fit has to be validated by
    KiCad DRC on the saved board, not claimed from a bbox.
+
+   Each explicit-move batch follows the same contract:
+   - **Preserve intentional placements.** Never move a footprint KiCad marks
+     locked, or one the user has called intentional (connectors, mounting
+     holes, mechanically fixed parts), even when `score_placement` flags it.
+     `get_component_list` does not report lock state, so an absent flag is
+     not evidence a part is free to move — ask when unsure. The planners hold
+     KiCad-locked footprints automatically; pass user-named ones in `locked`.
+   - **Read back the exact board after each batch.** Call
+     `get_component_list` for the same `board` and confirm every requested
+     reference landed at the requested position, rotation, and layer — and
+     nothing else moved — before planning the next batch. A mismatch or a
+     failed read stops the loop.
+   - **Disclose provenance.** When reporting results, state where each check
+     came from: `score_placement`'s `source` (`ipc` live board or
+     `saved_file`) and DRC's `source_evidence`. A saved-file answer excludes
+     unsaved editor state; say so rather than presenting it as the live board.
+   - **Report BLOCKED** when the current board state, true outline
+     containment, or another required fact cannot be established. A score,
+     a generated move list, or a plausible-looking layout is not
+     manufacturing acceptance.
 5. `place_decoupling_caps` — plans a row beside an IC from exact caller-given
    `capacitor_references` (never net-inferred); reports a blocked plan status
    naming why, and refuses to apply an out-of-bounds or non-improving plan.
